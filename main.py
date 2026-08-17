@@ -119,6 +119,11 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+async def reject_action(user_id: str, reason: str) -> None:
+    """Return a current authoritative state plus a human-readable action rejection."""
+    await manager.send_state(user_id, "action_rejected", reason=reason)
+
+
 def generate_crash():
     seed = secrets.token_hex(32)
     hashed = hashlib.sha256(seed.encode()).hexdigest()
@@ -445,20 +450,29 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, user_name: str)
             data = await websocket.receive_json()
             action = data.get("action")
 
-            if action == "join" and game_state["phase"] == "lobby":
+            if action == "join":
+                if game_state["phase"] != "lobby":
+                    await reject_action(user_id, "The lobby is sealed. This fuse already has victims.")
+                    continue
+
+                if any(player["id"] == user_id for player in game_state["players"]):
+                    await reject_action(user_id, "You already signed the waiver. Try not to enjoy it.")
+                    continue
+
                 balance = await get_balance(user_id)
-                if balance >= JOIN_COST and not any(
-                    player["id"] == user_id for player in game_state["players"]
-                ):
-                    if not await claim_action_slot(
-                        user_id, "join", JOIN_COOLDOWN_SECONDS
-                    ):
-                        continue
-                    await change_balance(user_id, -JOIN_COST)
-                    game_state["pot"] += JOIN_COST
-                    game_state["players"].append({"id": user_id, "name": user_name})
-                    await refresh_lobby_cards()
-                    await manager.broadcast_state("update")
+                if balance < JOIN_COST:
+                    await reject_action(user_id, "You need 100 ◉ to sign this waiver.")
+                    continue
+
+                if not await claim_action_slot(user_id, "join", JOIN_COOLDOWN_SECONDS):
+                    await reject_action(user_id, "The clerk is stamping your waiver. One moment.")
+                    continue
+
+                await change_balance(user_id, -JOIN_COST)
+                game_state["pot"] += JOIN_COST
+                game_state["players"].append({"id": user_id, "name": user_name})
+                await refresh_lobby_cards()
+                await manager.broadcast_state("update")
 
             elif (
                 action == "force_start"
