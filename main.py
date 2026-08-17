@@ -18,6 +18,8 @@ HOUSE_EDGE = 0.03
 PASS_FEE = 5.0
 JOIN_COST = 100.0
 DEFAULT_BALANCE = 500.0
+JOIN_COOLDOWN_SECONDS = 1.5
+PASS_COOLDOWN_SECONDS = 0.65
 
 game_state = {
     "phase": "lobby",
@@ -28,6 +30,7 @@ game_state = {
     "crash_point": 0.0,
     "hashed_seed": "",
     "server_seed": "",
+    "latest_round": None,
 }
 reset_task = None
 
@@ -57,6 +60,18 @@ async def change_balance(user_id: str, amount: float) -> float:
     """Apply a server-authorized balance change and return the rounded result."""
     updated = await redis_client.hincrbyfloat("ds:balances", user_id, amount)
     return round(float(updated), 2)
+
+
+async def claim_action_slot(user_id: str, action: str, cooldown_seconds: float) -> bool:
+    """Atomically reserve a server-enforced action slot for the given cooldown."""
+    key = f"ds:cooldowns:{action}:{user_id}"
+    acquired = await redis_client.set(
+        key,
+        "1",
+        nx=True,
+        px=max(1, int(cooldown_seconds * 1000)),
+    )
+    return bool(acquired)
 
 
 class ConnectionManager:
@@ -163,6 +178,14 @@ async def detonate():
         for survivor in survivors:
             await change_balance(survivor["id"], payout)
 
+    # Retain a compact, identity-free ticket after the lobby reopens. Names,
+    # user IDs, seeds, and balances are intentionally excluded.
+    game_state["latest_round"] = {
+        "multiplier": round(game_state["multiplier"], 2),
+        "payout": payout,
+        "survivor_count": len(survivors),
+    }
+
     await manager.broadcast_state("sploded", loser=loser_id, payout=payout)
     schedule_lobby_reset()
 
@@ -182,6 +205,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, user_name: str)
                 if balance >= JOIN_COST and not any(
                     player["id"] == user_id for player in game_state["players"]
                 ):
+                    if not await claim_action_slot(
+                        user_id, "join", JOIN_COOLDOWN_SECONDS
+                    ):
+                        continue
                     await change_balance(user_id, -JOIN_COST)
                     game_state["pot"] += JOIN_COST
                     game_state["players"].append({"id": user_id, "name": user_name})
@@ -208,6 +235,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, user_name: str)
                 if game_state["current_holder"] == user_id:
                     balance = await get_balance(user_id)
                     if balance >= PASS_FEE:
+                        if not await claim_action_slot(
+                            user_id, "pass", PASS_COOLDOWN_SECONDS
+                        ):
+                            continue
                         await change_balance(user_id, -PASS_FEE)
                         game_state["pot"] += PASS_FEE
 
