@@ -1,11 +1,12 @@
 import asyncio
 import hashlib
+import hmac
 import math
 import os
 import random
 import secrets
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 import redis.asyncio as aioredis
 
 app = FastAPI()
@@ -20,6 +21,8 @@ JOIN_COST = 100.0
 DEFAULT_BALANCE = 500.0
 JOIN_COOLDOWN_SECONDS = 1.5
 PASS_COOLDOWN_SECONDS = 0.65
+BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "dontsplodebot").lstrip("@")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 
 game_state = {
     "phase": "lobby",
@@ -116,6 +119,73 @@ def generate_crash():
     number = int(hashed[:8], 16)
     crash = max(1.00, (2**32 / (number + 1)) * (1.0 - HOUSE_EDGE))
     return seed, hashed, round(crash, 2)
+
+
+def current_lobby_card() -> dict:
+    """Build the public, visual announcement Telegram inserts into a selected chat."""
+    players = game_state["players"]
+    player_lines = "\n".join(
+        f"{index}. {player['name']}" for index, player in enumerate(players, start=1)
+    ) or "No victims have signed the waiver yet."
+    phase = game_state["phase"]
+    heading = "LOBBY OPEN" if phase == "lobby" else "ROUND IN PROGRESS"
+    text = (
+        "💣 <b>DON'T SPLODE</b> 💣\n"
+        "━━━━━━━━━━━━\n\n"
+        f"<b>{heading}</b>\n\n"
+        "Buy-in: <b>100 ◉</b>\n"
+        "Pass fee: <b>5 ◉</b> (bled into the pot)\n\n"
+        f"<b>Players ({len(players)}/12)</b>\n"
+        f"{player_lines}\n\n"
+        f"<b>Pot: {game_state['pot']:.0f} ◉</b>\n\n"
+        "<i>Click Join. Everything lives in this one block.</i>"
+    )
+    return {
+        "type": "article",
+        "id": "dont-splode-lobby",
+        "title": "DON'T SPLODE — Lobby Card",
+        "description": "Send a live lobby card with a Join button.",
+        "input_message_content": {
+            "message_text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        "reply_markup": {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "JOIN THE LOBBY — 100 ◉",
+                        "url": f"https://t.me/{BOT_USERNAME}?startapp=join",
+                    }
+                ]
+            ]
+        },
+    }
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+):
+    """Answer only Telegram inline queries; all game actions remain WebSocket-owned."""
+    if not TELEGRAM_WEBHOOK_SECRET or not hmac.compare_digest(
+        x_telegram_bot_api_secret_token or "", TELEGRAM_WEBHOOK_SECRET
+    ):
+        raise HTTPException(status_code=403, detail="Invalid Telegram webhook secret")
+
+    update = await request.json()
+    inline_query = update.get("inline_query")
+    if not inline_query:
+        return {"ok": True}
+
+    return {
+        "method": "answerInlineQuery",
+        "inline_query_id": inline_query["id"],
+        "results": [current_lobby_card()],
+        "cache_time": 0,
+        "is_personal": False,
+    }
 
 
 def reset_round_state():
