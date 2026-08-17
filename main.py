@@ -141,6 +141,17 @@ def current_lobby_card() -> dict:
         if phase == "lobby"
         else "<i>The fuse is lit. Keep your hands where we can see them.</i>"
     )
+    button = (
+        {
+            "text": "JOIN THE LOBBY — 100 ◉",
+            "url": f"https://t.me/{BOT_USERNAME}?startapp=join",
+        }
+        if phase == "lobby"
+        else {
+            "text": "🚫 LOBBY SEALED — FUSE LIT",
+            "callback_data": "lobby_closed",
+        }
+    )
     text = (
         "💣 <b>DON'T SPLODE</b> 💣\n"
         "━━━━━━━━━━━━\n\n"
@@ -164,12 +175,7 @@ def current_lobby_card() -> dict:
         },
         "reply_markup": {
             "inline_keyboard": [
-                [
-                    {
-                        "text": "JOIN THE LOBBY — 100 ◉",
-                        "url": f"https://t.me/{BOT_USERNAME}?startapp=join",
-                    }
-                ]
+                [button]
             ]
         },
     }
@@ -279,7 +285,11 @@ async def register_telegram_webhook() -> None:
         {
             "url": f"{PUBLIC_BACKEND_URL}/telegram/webhook",
             "secret_token": TELEGRAM_WEBHOOK_SECRET,
-            "allowed_updates": ["inline_query", "chosen_inline_result"],
+            "allowed_updates": [
+                "inline_query",
+                "chosen_inline_result",
+                "callback_query",
+            ],
             "drop_pending_updates": False,
         }
     ).encode("utf-8")
@@ -340,6 +350,15 @@ async def telegram_webhook(
     ):
         await redis_client.sadd(ACTIVE_LOBBY_CARDS_KEY, inline_message_id)
         await refresh_lobby_cards()
+
+    callback_query = update.get("callback_query") or {}
+    if callback_query.get("data") == "lobby_closed":
+        return {
+            "method": "answerCallbackQuery",
+            "callback_query_id": callback_query["id"],
+            "text": "The fuse is lit. Late entries are incinerated.",
+            "show_alert": False,
+        }
     return {"ok": True}
 
 
