@@ -1,10 +1,12 @@
 import asyncio
 import hashlib
 import hmac
+import json
 import math
 import os
 import random
 import secrets
+from urllib import request as url_request
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 import redis.asyncio as aioredis
@@ -22,7 +24,9 @@ DEFAULT_BALANCE = 500.0
 JOIN_COOLDOWN_SECONDS = 1.5
 PASS_COOLDOWN_SECONDS = 0.65
 BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "dontsplodebot").lstrip("@")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+PUBLIC_BACKEND_URL = "https://dont-splode-backend.onrender.com"
 
 game_state = {
     "phase": "lobby",
@@ -161,6 +165,45 @@ def current_lobby_card() -> dict:
             ]
         },
     }
+
+
+async def register_telegram_webhook() -> None:
+    """Register only the inline-query callback without printing credentials."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
+        return
+
+    endpoint = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    payload = json.dumps(
+        {
+            "url": f"{PUBLIC_BACKEND_URL}/telegram/webhook",
+            "secret_token": TELEGRAM_WEBHOOK_SECRET,
+            "allowed_updates": ["inline_query"],
+            "drop_pending_updates": False,
+        }
+    ).encode("utf-8")
+
+    def post_webhook_registration() -> None:
+        request = url_request.Request(
+            endpoint,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with url_request.urlopen(request, timeout=12) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        if not result.get("ok"):
+            raise RuntimeError("Telegram rejected webhook registration")
+
+    try:
+        await asyncio.to_thread(post_webhook_registration)
+    except Exception:
+        # Keep gameplay alive if Telegram is temporarily unavailable.
+        print("Telegram webhook registration deferred")
+
+
+@app.on_event("startup")
+async def configure_telegram_bot() -> None:
+    await register_telegram_webhook()
 
 
 @app.post("/telegram/webhook")
