@@ -196,6 +196,7 @@ async def register_telegram_webhook() -> None:
 
     try:
         await asyncio.to_thread(post_webhook_registration)
+        print("Telegram webhook registered")
     except Exception:
         # Keep gameplay alive if Telegram is temporarily unavailable.
         print("Telegram webhook registration deferred")
