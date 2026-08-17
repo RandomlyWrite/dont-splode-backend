@@ -6,6 +6,7 @@ import math
 import os
 import random
 import secrets
+from html import escape
 from urllib import request as url_request
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -27,6 +28,7 @@ BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "dontsplodebot").lstrip("@")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 PUBLIC_BACKEND_URL = "https://dont-splode-backend.onrender.com"
+ACTIVE_LOBBY_CARDS_KEY = "ds:active_lobby_cards"
 
 game_state = {
     "phase": "lobby",
@@ -129,10 +131,16 @@ def current_lobby_card() -> dict:
     """Build the public, visual announcement Telegram inserts into a selected chat."""
     players = game_state["players"]
     player_lines = "\n".join(
-        f"{index}. {player['name']}" for index, player in enumerate(players, start=1)
+        f"{index}. {escape(str(player['name']))}"
+        for index, player in enumerate(players, start=1)
     ) or "No victims have signed the waiver yet."
     phase = game_state["phase"]
     heading = "LOBBY OPEN" if phase == "lobby" else "ROUND IN PROGRESS"
+    footer = (
+        "<i>Click Join. Everything lives in this one block.</i>"
+        if phase == "lobby"
+        else "<i>The fuse is lit. Keep your hands where we can see them.</i>"
+    )
     text = (
         "💣 <b>DON'T SPLODE</b> 💣\n"
         "━━━━━━━━━━━━\n\n"
@@ -142,7 +150,7 @@ def current_lobby_card() -> dict:
         f"<b>Players ({len(players)}/12)</b>\n"
         f"{player_lines}\n\n"
         f"<b>Pot: {game_state['pot']:.0f} ◉</b>\n\n"
-        "<i>Click Join. Everything lives in this one block.</i>"
+        f"{footer}"
     )
     return {
         "type": "article",
@@ -167,6 +175,100 @@ def current_lobby_card() -> dict:
     }
 
 
+def current_round_result_card(payout: float, survivor_count: int) -> tuple[str, dict]:
+    """Build a compact public detonation result without private player data."""
+    multiplier = round(float(game_state["multiplier"]), 2)
+    survivor_label = "SOUL" if survivor_count == 1 else "SOULS"
+    text = (
+        "💥 <b>DON'T SPLODE — ROUND RESULT</b> 💥\n"
+        "━━━━━━━━━━━━\n\n"
+        "<b>THE FUSE WON.</b>\n\n"
+        f"Crash: <b>{multiplier:.2f}×</b>\n"
+        f"Escaped: <b>{survivor_count} {survivor_label}</b>\n"
+        f"Survivor split: <b>{payout:.2f} ◉</b>\n\n"
+        "<i>The cabinet swept up the ash. The next lobby needs fresh volunteers.</i>"
+    )
+    markup = {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "OPEN THE CABINET",
+                    "url": f"https://t.me/{BOT_USERNAME}?startapp=join",
+                }
+            ]
+        ]
+    }
+    return text, markup
+
+
+async def telegram_api_call(method: str, payload: dict) -> tuple[bool, dict]:
+    """Call Telegram without exposing credentials in logs or browser-visible state."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False, {}
+
+    endpoint = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    body = json.dumps(payload).encode("utf-8")
+
+    def post() -> dict:
+        request = url_request.Request(
+            endpoint,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with url_request.urlopen(request, timeout=12) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    try:
+        result = await asyncio.to_thread(post)
+        return bool(result.get("ok")), result
+    except Exception:
+        return False, {}
+
+
+async def edit_inline_card(inline_message_id: str, text: str, markup: dict) -> bool:
+    """Edit one tracked inline card and report whether Telegram accepted the edit."""
+    ok, _ = await telegram_api_call(
+        "editMessageText",
+        {
+            "inline_message_id": inline_message_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+            "reply_markup": markup,
+        },
+    )
+    return ok
+
+
+async def refresh_lobby_cards() -> None:
+    """Update every tracked lobby card from public authoritative game state."""
+    card_ids = await redis_client.smembers(ACTIVE_LOBBY_CARDS_KEY)
+    if not card_ids:
+        return
+    card = current_lobby_card()
+    text = card["input_message_content"]["message_text"]
+    markup = card["reply_markup"]
+    outcomes = await asyncio.gather(
+        *(edit_inline_card(card_id, text, markup) for card_id in card_ids)
+    )
+    stale_ids = [card_id for card_id, ok in zip(card_ids, outcomes) if not ok]
+    if stale_ids:
+        await redis_client.srem(ACTIVE_LOBBY_CARDS_KEY, *stale_ids)
+
+
+async def publish_round_results(payout: float, survivor_count: int) -> None:
+    """Transform live lobby cards into compact public detonation result cards."""
+    card_ids = await redis_client.smembers(ACTIVE_LOBBY_CARDS_KEY)
+    if not card_ids:
+        return
+    text, markup = current_round_result_card(payout, survivor_count)
+    await asyncio.gather(
+        *(edit_inline_card(card_id, text, markup) for card_id in card_ids)
+    )
+    await redis_client.delete(ACTIVE_LOBBY_CARDS_KEY)
+
+
 async def register_telegram_webhook() -> None:
     """Register only the inline-query callback without printing credentials."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
@@ -177,7 +279,7 @@ async def register_telegram_webhook() -> None:
         {
             "url": f"{PUBLIC_BACKEND_URL}/telegram/webhook",
             "secret_token": TELEGRAM_WEBHOOK_SECRET,
-            "allowed_updates": ["inline_query"],
+            "allowed_updates": ["inline_query", "chosen_inline_result"],
             "drop_pending_updates": False,
         }
     ).encode("utf-8")
@@ -212,7 +314,7 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ):
-    """Answer only Telegram inline queries; all game actions remain WebSocket-owned."""
+    """Answer lobby inline queries and remember selected cards for public updates."""
     if not TELEGRAM_WEBHOOK_SECRET or not hmac.compare_digest(
         x_telegram_bot_api_secret_token or "", TELEGRAM_WEBHOOK_SECRET
     ):
@@ -220,16 +322,25 @@ async def telegram_webhook(
 
     update = await request.json()
     inline_query = update.get("inline_query")
-    if not inline_query:
-        return {"ok": True}
+    if inline_query:
+        return {
+            "method": "answerInlineQuery",
+            "inline_query_id": inline_query["id"],
+            "results": [current_lobby_card()],
+            "cache_time": 0,
+            "is_personal": False,
+        }
 
-    return {
-        "method": "answerInlineQuery",
-        "inline_query_id": inline_query["id"],
-        "results": [current_lobby_card()],
-        "cache_time": 0,
-        "is_personal": False,
-    }
+    chosen_result = update.get("chosen_inline_result") or {}
+    inline_message_id = chosen_result.get("inline_message_id")
+    if (
+        chosen_result.get("result_id") == "dont-splode-lobby"
+        and isinstance(inline_message_id, str)
+        and inline_message_id
+    ):
+        await redis_client.sadd(ACTIVE_LOBBY_CARDS_KEY, inline_message_id)
+        await refresh_lobby_cards()
+    return {"ok": True}
 
 
 def reset_round_state():
@@ -300,6 +411,7 @@ async def detonate():
         "survivor_count": len(survivors),
     }
 
+    await publish_round_results(payout, len(survivors))
     await manager.broadcast_state("sploded", loser=loser_id, payout=payout)
     schedule_lobby_reset()
 
@@ -326,6 +438,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, user_name: str)
                     await change_balance(user_id, -JOIN_COST)
                     game_state["pot"] += JOIN_COST
                     game_state["players"].append({"id": user_id, "name": user_name})
+                    await refresh_lobby_cards()
                     await manager.broadcast_state("update")
 
             elif (
@@ -342,6 +455,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, user_name: str)
                 game_state["multiplier"] = 1.0
                 game_state["current_holder"] = random.choice(game_state["players"])["id"]
 
+                await refresh_lobby_cards()
                 await manager.broadcast_state("start")
                 asyncio.create_task(tick_bomb())
 
