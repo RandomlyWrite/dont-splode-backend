@@ -5,13 +5,18 @@ import json
 import math
 import os
 import random
+import re
 import secrets
 import time
 from html import escape
+from io import BytesIO
+from pathlib import Path
 from urllib import request as url_request
 from urllib.parse import parse_qsl
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 import redis.asyncio as aioredis
 
 app = FastAPI()
@@ -49,6 +54,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 PUBLIC_BACKEND_URL = "https://dont-splode-backend.onrender.com"
 ACTIVE_LOBBY_CARDS_KEY = "ds:active_lobby_cards"
+ELIMINATION_MEDIA_CARDS_KEY = "ds:elimination_media_cards"
+POSTER_WIDTH = 1080
+POSTER_HEIGHT = 1350
+POSTER_TTL_SECONDS = 20 * 60
+ASSET_DIR = Path(__file__).resolve().parent / "assets"
+POSTER_FONT_PATH = ASSET_DIR / "DejaVuSans-Bold.ttf"
+POSTER_MASCOT_PATH = ASSET_DIR / "hands-of-calamity.png"
+poster_cache: dict[str, tuple[bytes, float]] = {}
 
 game_state = {
     "phase": "lobby",
@@ -117,8 +130,8 @@ async def daily_claim_status(user_id: str) -> dict:
     return {"available": False, "seconds_until": int(ttl), "amount": DAILY_CHIP_GRANT}
 
 
-def verified_telegram_user_id(init_data: str) -> str | None:
-    """Validate Telegram Mini App init data before using it for an administrator role."""
+def verified_telegram_user(init_data: str) -> dict | None:
+    """Return verified Telegram user data without ever trusting the URL path identity."""
     if not TELEGRAM_BOT_TOKEN or not init_data:
         return None
     try:
@@ -133,9 +146,169 @@ def verified_telegram_user_id(init_data: str) -> str | None:
         if not hmac.compare_digest(calculated_hash, supplied_hash):
             return None
         user = json.loads(fields["user"])
-        return str(user["id"])
+        return user if isinstance(user, dict) and user.get("id") is not None else None
     except (KeyError, ValueError, TypeError, json.JSONDecodeError):
         return None
+
+
+def verified_telegram_user_id(init_data: str) -> str | None:
+    """Return only the verified Telegram ID for privilege checks."""
+    user = verified_telegram_user(init_data)
+    return str(user["id"]) if user else None
+
+
+def public_player_label(player: dict | None) -> str:
+    """Prefer a verified Telegram handle; otherwise use the existing public lobby name."""
+    player = player or {}
+    handle = str(player.get("public_handle") or "").strip()
+    if handle:
+        return f"@{handle.lstrip('@')[:32]}"
+    fallback = str(player.get("name") or "UNKNOWN VICTIM").strip()
+    return fallback[:36] or "UNKNOWN VICTIM"
+
+
+def _poster_font(size: int):
+    try:
+        return ImageFont.truetype(str(POSTER_FONT_PATH), size=size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _fit_poster_text(draw: ImageDraw.ImageDraw, text: str, max_width: int, start_size: int):
+    for size in range(start_size, 28, -2):
+        font = _poster_font(size)
+        if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+            return font
+    return _poster_font(28)
+
+
+def _center_poster_text(draw: ImageDraw.ImageDraw, text: str, y: int, font, fill: str, *, stroke: int = 0, stroke_fill: str = "#0e0d0b"):
+    bounds = draw.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    x = (POSTER_WIDTH - (bounds[2] - bounds[0])) // 2
+    draw.text((x, y), text, font=font, fill=fill, stroke_width=stroke, stroke_fill=stroke_fill)
+
+
+def render_elimination_poster(loser: dict | None, survivor_count: int) -> bytes:
+    """Render a compact public image card; no balances, IDs, seeds, or private metadata enter it."""
+    public_label = public_player_label(loser)
+    multiplier = round(float(game_state["multiplier"]), 2)
+    image = Image.new("RGB", (POSTER_WIDTH, POSTER_HEIGHT), "#11100e")
+    draw = ImageDraw.Draw(image)
+
+    # Brass cabinet body, coal-enamel inset, and intentional soot texture.
+    draw.rectangle((0, 0, POSTER_WIDTH, POSTER_HEIGHT), fill="#100f0d")
+    draw.rectangle((26, 26, POSTER_WIDTH - 26, POSTER_HEIGHT - 26), fill="#56421f", outline="#c99c4d", width=10)
+    draw.rectangle((62, 62, POSTER_WIDTH - 62, POSTER_HEIGHT - 62), fill="#171511", outline="#0b0a08", width=18)
+    for x, y in ((48, 48), (POSTER_WIDTH - 48, 48), (48, POSTER_HEIGHT - 48), (POSTER_WIDTH - 48, POSTER_HEIGHT - 48)):
+        draw.ellipse((x - 10, y - 10, x + 10, y + 10), fill="#231a0d", outline="#e2bb67", width=3)
+
+    randomizer = random.Random(f"{public_label}:{multiplier}:{survivor_count}")
+    soot = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    soot_draw = ImageDraw.Draw(soot)
+    for _ in range(90):
+        x = randomizer.randrange(70, POSTER_WIDTH - 70)
+        y = randomizer.randrange(80, POSTER_HEIGHT - 80)
+        radius = randomizer.randrange(4, 18)
+        soot_draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=(7, 6, 4, randomizer.randrange(8, 28)))
+    image = Image.alpha_composite(image.convert("RGBA"), soot.filter(ImageFilter.GaussianBlur(3)))
+    draw = ImageDraw.Draw(image)
+
+    small = _poster_font(26)
+    headline = _fit_poster_text(draw, f"OPE, {public_label.upper()}", 890, 86)
+    subhead = _poster_font(84)
+    _center_poster_text(draw, "CABINET CASUALTY REPORT", 95, small, "#e1b861")
+    _center_poster_text(draw, f"OPE, {public_label.upper()}", 144, headline, "#f04a40", stroke=4, stroke_fill="#220b09")
+    _center_poster_text(draw, "SPLODED!", 246, subhead, "#f04a40", stroke=5, stroke_fill="#220b09")
+    draw.line((126, 354, POSTER_WIDTH - 126, 354), fill="#c59a4d", width=3)
+
+    if POSTER_MASCOT_PATH.exists():
+        with Image.open(POSTER_MASCOT_PATH).convert("RGBA") as mascot_source:
+            mascot = mascot_source.copy()
+        mascot.thumbnail((770, 650), Image.Resampling.LANCZOS)
+        mascot_x = (POSTER_WIDTH - mascot.width) // 2
+        mascot_y = 355
+        darkened = mascot.copy()
+        black_layer = Image.new("RGBA", darkened.size, (0, 0, 0, 105))
+        darkened = Image.alpha_composite(darkened, black_layer)
+        image.alpha_composite(darkened, (mascot_x, mascot_y))
+        eye_y = mascot_y + int(mascot.height * 0.37)
+        eye_gap = int(mascot.width * 0.16)
+        eye_x = POSTER_WIDTH // 2
+        for offset in (-eye_gap, eye_gap):
+            cx = eye_x + offset
+            draw.line((cx - 35, eye_y - 35, cx + 35, eye_y + 35), fill="#fff7dd", width=17)
+            draw.line((cx + 35, eye_y - 35, cx - 35, eye_y + 35), fill="#fff7dd", width=17)
+    else:
+        draw.ellipse((310, 410, 770, 870), fill="#2a2822", outline="#b68e47", width=10)
+        for offset in (-95, 95):
+            cx = POSTER_WIDTH // 2 + offset
+            draw.line((cx - 38, 570 - 38, cx + 38, 570 + 38), fill="#fff7dd", width=18)
+            draw.line((cx + 38, 570 - 38, cx - 38, 570 + 38), fill="#fff7dd", width=18)
+
+    # Shattered-glass cracks are decorative; their placement never obscures the public result.
+    for _ in range(17):
+        edge = randomizer.choice(("left", "right", "top", "bottom"))
+        if edge == "left":
+            start = (75, randomizer.randrange(90, POSTER_HEIGHT - 90))
+        elif edge == "right":
+            start = (POSTER_WIDTH - 75, randomizer.randrange(90, POSTER_HEIGHT - 90))
+        elif edge == "top":
+            start = (randomizer.randrange(90, POSTER_WIDTH - 90), 75)
+        else:
+            start = (randomizer.randrange(90, POSTER_WIDTH - 90), POSTER_HEIGHT - 75)
+        end = (start[0] + randomizer.randrange(-180, 181), start[1] + randomizer.randrange(-180, 181))
+        draw.line((start, end), fill=(213, 213, 202, 115), width=3)
+
+    draw.rounded_rectangle((112, 1005, POSTER_WIDTH - 112, 1195), radius=18, fill="#0d0c0a", outline="#b58a45", width=4)
+    stats_label = _poster_font(25)
+    stats_value = _poster_font(49)
+    draw.text((158, 1045), "CRASH POINT", font=stats_label, fill="#d2b574")
+    draw.text((158, 1085), f"{multiplier:.2f}×", font=stats_value, fill="#f1d07b")
+    draw.text((600, 1045), "SOULS WITH A PULSE", font=stats_label, fill="#d2b574")
+    draw.text((600, 1085), str(max(0, survivor_count)), font=stats_value, fill="#9ce58c")
+    _center_poster_text(draw, "THE FUSE ACCEPTED YOUR DONATION.", 1240, _poster_font(23), "#c9b581")
+
+    buffer = BytesIO()
+    image.convert("RGB").save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
+def cache_elimination_poster(loser: dict | None, survivor_count: int) -> str:
+    """Store a short-lived card image until Telegram fetches the remote media URL."""
+    now = time.time()
+    expired = [key for key, (_, expires_at) in poster_cache.items() if expires_at <= now]
+    for key in expired:
+        poster_cache.pop(key, None)
+    poster_key = secrets.token_urlsafe(12)
+    poster_cache[poster_key] = (render_elimination_poster(loser, survivor_count), now + POSTER_TTL_SECONDS)
+    return poster_key
+
+
+def render_lobby_poster() -> bytes:
+    """Render the first photo card so Telegram can later replace its media in place."""
+    image = Image.new("RGBA", (POSTER_WIDTH, POSTER_HEIGHT), "#11100e")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, POSTER_WIDTH, POSTER_HEIGHT), fill="#100f0d")
+    draw.rectangle((26, 26, POSTER_WIDTH - 26, POSTER_HEIGHT - 26), fill="#56421f", outline="#c99c4d", width=10)
+    draw.rectangle((62, 62, POSTER_WIDTH - 62, POSTER_HEIGHT - 62), fill="#171511", outline="#0b0a08", width=18)
+    for x, y in ((48, 48), (POSTER_WIDTH - 48, 48), (48, POSTER_HEIGHT - 48), (POSTER_WIDTH - 48, POSTER_HEIGHT - 48)):
+        draw.ellipse((x - 10, y - 10, x + 10, y + 10), fill="#231a0d", outline="#e2bb67", width=3)
+    _center_poster_text(draw, "GROUP GAME // VIRTUAL CHIPS", 95, _poster_font(26), "#e1b861")
+    _center_poster_text(draw, "DON'T", 142, _poster_font(108), "#f1d07b", stroke=4, stroke_fill="#25180d")
+    _center_poster_text(draw, "SPLODE", 263, _poster_font(108), "#f1d07b", stroke=4, stroke_fill="#25180d")
+    if POSTER_MASCOT_PATH.exists():
+        with Image.open(POSTER_MASCOT_PATH).convert("RGBA") as mascot_source:
+            mascot = mascot_source.copy()
+        mascot.thumbnail((780, 720), Image.Resampling.LANCZOS)
+        image.alpha_composite(mascot, ((POSTER_WIDTH - mascot.width) // 2, 356))
+    else:
+        draw.ellipse((310, 440, 770, 900), fill="#2a2822", outline="#b68e47", width=10)
+    draw.rounded_rectangle((118, 1080, POSTER_WIDTH - 118, 1195), radius=18, fill="#0d0c0a", outline="#b58a45", width=4)
+    _center_poster_text(draw, "SIGN THE WAIVER. HOLD LIGHT IT UP.", 1120, _poster_font(32), "#f04a40")
+    _center_poster_text(draw, "THE FUSE DOES NOT RESPECT HESITATION.", 1242, _poster_font(23), "#c9b581")
+    buffer = BytesIO()
+    image.convert("RGB").save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
 
 
 class ConnectionManager:
@@ -273,15 +446,14 @@ def current_lobby_card() -> dict:
         f"{footer}"
     )
     return {
-        "type": "article",
+        "type": "photo",
         "id": "dont-splode-lobby",
         "title": "DON'T SPLODE — Lobby Card",
         "description": "Send a live lobby card with a Join button.",
-        "input_message_content": {
-            "message_text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
+        "photo_url": f"{PUBLIC_BACKEND_URL}/telegram/posters/lobby.png",
+        "thumbnail_url": f"{PUBLIC_BACKEND_URL}/telegram/posters/lobby.png",
+        "caption": text,
+        "parse_mode": "HTML",
         "reply_markup": {
             "inline_keyboard": [
                 [button]
@@ -312,6 +484,23 @@ def current_round_result_card(payout: float, survivor_count: int) -> tuple[str, 
                 }
             ]
         ]
+    }
+    return text, markup
+
+
+def current_elimination_card(loser: dict | None, survivor_count: int) -> tuple[str, dict]:
+    """Build the caption and sealed-lobby control for a public elimination poster."""
+    victim = escape(public_player_label(loser))
+    multiplier = round(float(game_state["multiplier"]), 2)
+    soul_label = "SOUL" if survivor_count == 1 else "SOULS"
+    text = (
+        f"💥 <b>OPE, {victim} SPLODED.</b>\n\n"
+        f"Crash: <b>{multiplier:.2f}×</b>\n"
+        f"Still breathing: <b>{survivor_count} {soul_label}</b>\n\n"
+        "<i>The cabinet has accepted a fresh contribution to the ash pile.</i>"
+    )
+    markup = {
+        "inline_keyboard": [[{"text": "🚫 LOBBY SEALED — ASH SETTLING", "callback_data": "lobby_closed"}]]
     }
     return text, markup
 
@@ -375,20 +564,72 @@ async def edit_inline_card(inline_message_id: str, text: str, markup: dict) -> b
     return False
 
 
+async def edit_inline_caption(inline_message_id: str, text: str, markup: dict) -> bool:
+    """Update an inline photo card caption while preserving its current image."""
+    ok, result = await telegram_api_call(
+        "editMessageCaption",
+        {
+            "inline_message_id": inline_message_id,
+            "caption": text,
+            "parse_mode": "HTML",
+            "reply_markup": markup,
+        },
+    )
+    if ok or "message is not modified" in str(result.get("description", "")).lower():
+        return True
+    print("Telegram inline image caption edit failed", json.dumps({"inline_message_id_length": len(inline_message_id)}))
+    return False
+
+
+async def edit_inline_media(inline_message_id: str, poster_key: str, text: str, markup: dict) -> bool:
+    """Replace an existing inline photo card with the public-safe knockout poster."""
+    ok, _ = await telegram_api_call(
+        "editMessageMedia",
+        {
+            "inline_message_id": inline_message_id,
+            "media": {
+                "type": "photo",
+                "media": f"{PUBLIC_BACKEND_URL}/telegram/posters/{poster_key}.png",
+                "caption": text,
+                "parse_mode": "HTML",
+            },
+            "reply_markup": markup,
+        },
+    )
+    if not ok:
+        print("Telegram inline card media edit failed", json.dumps({"inline_message_id_length": len(inline_message_id)}))
+    return ok
+
+
 async def refresh_lobby_cards() -> None:
     """Update every tracked lobby card from public authoritative game state."""
     card_ids = await redis_client.smembers(ACTIVE_LOBBY_CARDS_KEY)
     if not card_ids:
         return
     card = current_lobby_card()
-    text = card["input_message_content"]["message_text"]
+    text = card["caption"]
     markup = card["reply_markup"]
     outcomes = await asyncio.gather(
-        *(edit_inline_card(card_id, text, markup) for card_id in card_ids)
+        *(edit_inline_caption(card_id, text, markup) for card_id in card_ids)
     )
     stale_ids = [card_id for card_id, ok in zip(card_ids, outcomes) if not ok]
     if stale_ids:
         print(f"Removing {len(stale_ids)} stale Telegram inline card(s)")
+        await redis_client.srem(ACTIVE_LOBBY_CARDS_KEY, *stale_ids)
+
+
+async def publish_elimination_poster(loser: dict | None, survivor_count: int) -> None:
+    """Transform every tracked group lobby card into the current public knockout poster."""
+    card_ids = await redis_client.smembers(ACTIVE_LOBBY_CARDS_KEY)
+    if not card_ids:
+        return
+    poster_key = cache_elimination_poster(loser, survivor_count)
+    text, markup = current_elimination_card(loser, survivor_count)
+    outcomes = await asyncio.gather(
+        *(edit_inline_media(card_id, poster_key, text, markup) for card_id in card_ids)
+    )
+    stale_ids = [card_id for card_id, ok in zip(card_ids, outcomes) if not ok]
+    if stale_ids:
         await redis_client.srem(ACTIVE_LOBBY_CARDS_KEY, *stale_ids)
 
 
@@ -399,7 +640,7 @@ async def publish_round_results(payout: float, survivor_count: int) -> None:
         return
     text, markup = current_round_result_card(payout, survivor_count)
     await asyncio.gather(
-        *(edit_inline_card(card_id, text, markup) for card_id in card_ids)
+        *(edit_inline_caption(card_id, text, markup) for card_id in card_ids)
     )
     await redis_client.delete(ACTIVE_LOBBY_CARDS_KEY)
 
@@ -446,6 +687,22 @@ async def register_telegram_webhook() -> None:
 @app.on_event("startup")
 async def configure_telegram_bot() -> None:
     await register_telegram_webhook()
+
+
+@app.get("/telegram/posters/{poster_key}.png")
+async def telegram_elimination_poster(poster_key: str):
+    """Serve a short-lived result image for Telegram's editMessageMedia fetch."""
+    if poster_key == "lobby":
+        return Response(
+            content=render_lobby_poster(),
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+    cached = poster_cache.get(poster_key)
+    if not cached or cached[1] <= time.time():
+        poster_cache.pop(poster_key, None)
+        raise HTTPException(status_code=404, detail="Elimination poster has expired")
+    return Response(content=cached[0], media_type="image/png", headers={"Cache-Control": "public, max-age=300"})
 
 
 @app.post("/telegram/webhook")
@@ -665,6 +922,7 @@ async def detonate():
             "eliminations": len(game_state["eliminated_players"]),
             "rounds": game_state["round_number"],
         }
+        await publish_elimination_poster(loser, len(survivors))
         await publish_round_results(payout, len(survivors))
         await manager.broadcast_state(
             "sploded",
@@ -677,7 +935,7 @@ async def detonate():
         return
 
     game_state["phase"] = "intermission"
-    await refresh_lobby_cards()
+    await publish_elimination_poster(loser, len(survivors))
     await manager.broadcast_state(
         "eliminated",
         loser=loser_id,
@@ -696,7 +954,10 @@ async def websocket_endpoint(
     user_name: str,
     tg_init_data: str = "",
 ):
-    verified_user_id = verified_telegram_user_id(tg_init_data)
+    verified_user = verified_telegram_user(tg_init_data)
+    verified_user_id = str(verified_user["id"]) if verified_user else None
+    raw_handle = str((verified_user or {}).get("username") or "")
+    public_handle = raw_handle if re.fullmatch(r"[A-Za-z0-9_]{5,32}", raw_handle) else ""
     is_pit_boss = bool(
         verified_user_id
         and verified_user_id == user_id
@@ -733,7 +994,7 @@ async def websocket_endpoint(
 
                 await change_balance(user_id, -JOIN_COST)
                 game_state["pot"] += JOIN_COST
-                game_state["players"].append({"id": user_id, "name": user_name})
+                game_state["players"].append({"id": user_id, "name": user_name, "public_handle": public_handle})
                 if (
                     len(game_state["players"]) >= MINIMUM_COUNTDOWN_PLAYERS
                     and not game_state.get("lobby_auto_start_at")

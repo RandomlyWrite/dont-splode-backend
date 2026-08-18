@@ -29,6 +29,7 @@ async def run_checks() -> None:
 
     main.refresh_lobby_cards = no_op
     main.publish_round_results = no_op
+    main.publish_elimination_poster = no_op
     main.manager.broadcast_state = capture_broadcast
     main.change_balance = capture_balance
     main.schedule_next_round = lambda: scheduled.append("next")
@@ -174,6 +175,37 @@ async def run_checks() -> None:
         main.telegram_api_call = failed_telegram_call
         assert not await main.edit_inline_card("inline-card-id", "next card", {"inline_keyboard": []})
         print("Card guard: harmless initial no-op edits retain the tracked inline message ID.")
+    finally:
+        main.telegram_api_call = original_telegram_call
+
+    poster_loser = {"id": "private-user-id", "name": "Private Name", "public_handle": "cabinetvictim"}
+    main.game_state["multiplier"] = 2.75
+    poster = main.render_elimination_poster(poster_loser, 3)
+    assert poster.startswith(b"\x89PNG\r\n\x1a\n")
+    caption, _ = main.current_elimination_card(poster_loser, 3)
+    assert "@cabinetvictim" in caption
+    assert "2.75×" in caption
+    assert "3 SOULS" in caption
+    assert "private-user-id" not in caption
+    assert "balance" not in caption.lower()
+    lobby_card = main.current_lobby_card()
+    assert lobby_card["type"] == "photo"
+    assert lobby_card["photo_url"].endswith("/telegram/posters/lobby.png")
+
+    media_calls: list[tuple[str, dict]] = []
+
+    async def capture_media_call(method: str, payload: dict):
+        media_calls.append((method, payload))
+        return True, {"ok": True}
+
+    main.telegram_api_call = capture_media_call
+    try:
+        assert await main.edit_inline_media("inline-card-id", "poster-key", caption, {"inline_keyboard": []})
+        assert media_calls[-1][0] == "editMessageMedia"
+        assert media_calls[-1][1]["media"]["type"] == "photo"
+        assert media_calls[-1][1]["media"]["media"].endswith("/telegram/posters/poster-key.png")
+        assert "private-user-id" not in media_calls[-1][1]["media"]["caption"]
+        print("Poster guard: inline cards begin as photos and transform with public-safe knockout media.")
     finally:
         main.telegram_api_call = original_telegram_call
 
