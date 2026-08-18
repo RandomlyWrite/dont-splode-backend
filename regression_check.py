@@ -29,6 +29,7 @@ async def run_checks() -> None:
 
     main.refresh_lobby_cards = no_op
     main.publish_round_results = no_op
+    original_publish_elimination_poster = main.publish_elimination_poster
     main.publish_elimination_poster = no_op
     main.manager.broadcast_state = capture_broadcast
     main.change_balance = capture_balance
@@ -179,15 +180,25 @@ async def run_checks() -> None:
         main.telegram_api_call = original_telegram_call
 
     poster_loser = {"id": "private-user-id", "name": "Private Name", "public_handle": "cabinetvictim"}
+    poster_survivors = [
+        {"id": "safe-1", "name": "First Public", "public_handle": "fusefriend"},
+        {"id": "safe-2", "name": "Second Public"},
+        {"id": "safe-3", "name": "Third Public", "public_handle": "lastbreather"},
+    ]
     main.game_state["multiplier"] = 2.75
-    poster = main.render_elimination_poster(poster_loser, 3)
+    poster = main.render_elimination_poster(poster_loser, len(poster_survivors))
     assert poster.startswith(b"\x89PNG\r\n\x1a\n")
-    caption, _ = main.current_elimination_card(poster_loser, 3)
+    caption, _ = main.current_elimination_card(poster_loser, poster_survivors)
     assert "@cabinetvictim" in caption
     assert "2.75×" in caption
     assert "3 SOULS" in caption
+    assert "@fusefriend" in caption
+    assert "Second Public" in caption
+    assert "@lastbreather" in caption
     assert "private-user-id" not in caption
     assert "balance" not in caption.lower()
+    final_caption, _ = main.current_round_result_card(415.0, poster_survivors[:1])
+    assert "@fusefriend" in final_caption
     lobby_card = main.current_lobby_card()
     assert lobby_card["type"] == "photo"
     assert lobby_card["photo_url"].endswith("/telegram/posters/lobby.png")
@@ -207,6 +218,56 @@ async def run_checks() -> None:
         assert "private-user-id" not in media_calls[-1][1]["media"]["caption"]
         print("Poster guard: inline cards begin as photos and transform with public-safe knockout media.")
     finally:
+        main.telegram_api_call = original_telegram_call
+
+    class PosterRedis:
+        async def smembers(self, key):
+            return {"three-player-inline-card"} if key == main.ACTIVE_LOBBY_CARDS_KEY else set()
+
+        async def srem(self, *_args):
+            return 0
+
+    three_player_calls: list[tuple[str, dict]] = []
+
+    async def capture_three_player_media(method: str, payload: dict):
+        three_player_calls.append((method, payload))
+        return True, {"ok": True}
+
+    original_poster_redis = main.redis_client
+    main.redis_client = PosterRedis()
+    main.telegram_api_call = capture_three_player_media
+    main.publish_elimination_poster = original_publish_elimination_poster
+    try:
+        main.game_state.update(
+            {
+                "phase": "running",
+                "players": [
+                    {"id": "blast", "name": "Blast Test", "public_handle": "blasttest"},
+                    {"id": "survivor-a", "name": "Alpha", "public_handle": "alphaalive"},
+                    {"id": "survivor-b", "name": "Bravo"},
+                ],
+                "eliminated_players": [],
+                "current_holder": "blast",
+                "multiplier": 3.5,
+                "pot": 300.0,
+                "round_number": 1,
+            }
+        )
+        await main.detonate()
+        assert main.game_state["phase"] == "intermission"
+        assert [player["id"] for player in main.game_state["players"]] == ["survivor-a", "survivor-b"]
+        media_method, media_payload = three_player_calls[-1]
+        assert media_method == "editMessageMedia"
+        assert media_payload["inline_message_id"] == "three-player-inline-card"
+        media_caption = media_payload["media"]["caption"]
+        assert "@blasttest" in media_caption
+        assert "@alphaalive" in media_caption
+        assert "Bravo" in media_caption
+        assert "3.50×" in media_caption
+        assert "survivor-a" not in media_caption
+        print("Three-player poster test: first elimination replaced the inline photo and named the two remaining public players.")
+    finally:
+        main.redis_client = original_poster_redis
         main.telegram_api_call = original_telegram_call
 
     ignition_ticks: list[str] = []

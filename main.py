@@ -462,16 +462,24 @@ def current_lobby_card() -> dict:
     }
 
 
-def current_round_result_card(payout: float, survivor_count: int) -> tuple[str, dict]:
+def public_remaining_players_caption(players: list[dict]) -> str:
+    """Format the remaining public player labels for a Telegram caption without exposing IDs."""
+    labels = [escape(public_player_label(player)) for player in players[:MAX_PLAYERS]]
+    return " • ".join(labels) if labels else "Nobody. The cabinet got hungry."
+
+
+def current_round_result_card(payout: float, survivors: list[dict]) -> tuple[str, dict]:
     """Build a compact public final-match result without private player data."""
     multiplier = round(float(game_state["multiplier"]), 2)
+    survivor_count = len(survivors)
     survivor_label = "SOUL" if survivor_count == 1 else "SOULS"
+    remaining_players = public_remaining_players_caption(survivors)
     text = (
         "💥 <b>DON'T SPLODE — ROUND RESULT</b> 💥\n"
         "━━━━━━━━━━━━\n\n"
         "<b>THE FUSE WON.</b>\n\n"
         f"Crash: <b>{multiplier:.2f}×</b>\n"
-        f"Last standing: <b>{survivor_count} {survivor_label}</b>\n"
+        f"Last standing: <b>{survivor_count} {survivor_label}</b> — <b>{remaining_players}</b>\n"
         f"Final pot: <b>{payout:.2f} ◉</b>\n\n"
         "<i>The cabinet swept up the ash. The next lobby needs fresh volunteers.</i>"
     )
@@ -488,15 +496,18 @@ def current_round_result_card(payout: float, survivor_count: int) -> tuple[str, 
     return text, markup
 
 
-def current_elimination_card(loser: dict | None, survivor_count: int) -> tuple[str, dict]:
+def current_elimination_card(loser: dict | None, survivors: list[dict]) -> tuple[str, dict]:
     """Build the caption and sealed-lobby control for a public elimination poster."""
     victim = escape(public_player_label(loser))
     multiplier = round(float(game_state["multiplier"]), 2)
+    survivor_count = len(survivors)
     soul_label = "SOUL" if survivor_count == 1 else "SOULS"
+    remaining_players = public_remaining_players_caption(survivors)
     text = (
         f"💥 <b>OPE, {victim} SPLODED.</b>\n\n"
         f"Crash: <b>{multiplier:.2f}×</b>\n"
-        f"Still breathing: <b>{survivor_count} {soul_label}</b>\n\n"
+        f"Still breathing: <b>{survivor_count} {soul_label}</b>\n"
+        f"<b>Remaining with a pulse:</b> {remaining_players}\n\n"
         "<i>The cabinet has accepted a fresh contribution to the ash pile.</i>"
     )
     markup = {
@@ -618,13 +629,13 @@ async def refresh_lobby_cards() -> None:
         await redis_client.srem(ACTIVE_LOBBY_CARDS_KEY, *stale_ids)
 
 
-async def publish_elimination_poster(loser: dict | None, survivor_count: int) -> None:
+async def publish_elimination_poster(loser: dict | None, survivors: list[dict]) -> None:
     """Transform every tracked group lobby card into the current public knockout poster."""
     card_ids = await redis_client.smembers(ACTIVE_LOBBY_CARDS_KEY)
     if not card_ids:
         return
-    poster_key = cache_elimination_poster(loser, survivor_count)
-    text, markup = current_elimination_card(loser, survivor_count)
+    poster_key = cache_elimination_poster(loser, len(survivors))
+    text, markup = current_elimination_card(loser, survivors)
     outcomes = await asyncio.gather(
         *(edit_inline_media(card_id, poster_key, text, markup) for card_id in card_ids)
     )
@@ -633,12 +644,12 @@ async def publish_elimination_poster(loser: dict | None, survivor_count: int) ->
         await redis_client.srem(ACTIVE_LOBBY_CARDS_KEY, *stale_ids)
 
 
-async def publish_round_results(payout: float, survivor_count: int) -> None:
+async def publish_round_results(payout: float, survivors: list[dict]) -> None:
     """Transform live lobby cards into compact public detonation result cards."""
     card_ids = await redis_client.smembers(ACTIVE_LOBBY_CARDS_KEY)
     if not card_ids:
         return
-    text, markup = current_round_result_card(payout, survivor_count)
+    text, markup = current_round_result_card(payout, survivors)
     await asyncio.gather(
         *(edit_inline_caption(card_id, text, markup) for card_id in card_ids)
     )
@@ -922,8 +933,8 @@ async def detonate():
             "eliminations": len(game_state["eliminated_players"]),
             "rounds": game_state["round_number"],
         }
-        await publish_elimination_poster(loser, len(survivors))
-        await publish_round_results(payout, len(survivors))
+        await publish_elimination_poster(loser, survivors)
+        await publish_round_results(payout, survivors)
         await manager.broadcast_state(
             "sploded",
             loser=loser_id,
@@ -935,7 +946,7 @@ async def detonate():
         return
 
     game_state["phase"] = "intermission"
-    await publish_elimination_poster(loser, len(survivors))
+    await publish_elimination_poster(loser, survivors)
     await manager.broadcast_state(
         "eliminated",
         loser=loser_id,
