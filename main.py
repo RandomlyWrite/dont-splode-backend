@@ -139,14 +139,22 @@ class ConnectionManager:
 
     async def connect(self, websocket: WebSocket, user_id: str, is_pit_boss: bool = False):
         await websocket.accept()
+        previous_connection = self.active_connections.get(user_id)
         self.active_connections[user_id] = websocket
         if is_pit_boss:
             self.pit_boss_connections.add(user_id)
+        else:
+            self.pit_boss_connections.discard(user_id)
+        if previous_connection is not None and previous_connection is not websocket:
+            try:
+                await previous_connection.close(code=4001, reason="A newer game session replaced this one.")
+            except Exception:
+                pass
 
-    def disconnect(self, user_id: str):
-        if user_id in self.active_connections:
+    def disconnect(self, user_id: str, websocket: WebSocket | None = None):
+        if websocket is None or self.active_connections.get(user_id) is websocket:
             del self.active_connections[user_id]
-        self.pit_boss_connections.discard(user_id)
+            self.pit_boss_connections.discard(user_id)
 
     async def send_state(self, user_id: str, event_type: str, **extra):
         connection = self.active_connections.get(user_id)
@@ -604,6 +612,9 @@ async def websocket_endpoint(
     try:
         while True:
             data = await websocket.receive_json()
+            if manager.active_connections.get(user_id) is not websocket:
+                await websocket.close(code=4001, reason="A newer game session replaced this one.")
+                break
             action = data.get("action")
 
             if action == "join":
@@ -747,4 +758,4 @@ async def websocket_endpoint(
                         await manager.broadcast_state("update")
 
     except WebSocketDisconnect:
-        manager.disconnect(user_id)
+        manager.disconnect(user_id, websocket)

@@ -100,6 +100,31 @@ async def run_checks() -> None:
     assert main.game_state["round_number"] == 0
     print("Reset: fresh lobby; no active players; no ash record; pot 0.0 ◉.")
 
+    class FakeSocket:
+        def __init__(self):
+            self.accepted = False
+            self.closed: tuple[int, str] | None = None
+
+        async def accept(self):
+            self.accepted = True
+
+        async def close(self, code: int = 1000, reason: str = ""):
+            self.closed = (code, reason)
+
+    session_manager = main.ConnectionManager()
+    first_session = FakeSocket()
+    second_session = FakeSocket()
+    await session_manager.connect(first_session, "duplicate-user")
+    await session_manager.connect(second_session, "duplicate-user")
+    assert first_session.closed is not None
+    assert first_session.closed[0] == 4001
+    assert session_manager.active_connections["duplicate-user"] is second_session
+    session_manager.disconnect("duplicate-user", first_session)
+    assert session_manager.active_connections["duplicate-user"] is second_session
+    session_manager.disconnect("duplicate-user", second_session)
+    assert "duplicate-user" not in session_manager.active_connections
+    print("Session guard: stale duplicate closes; newer session stays authoritative.")
+
 
 if __name__ == "__main__":
     asyncio.run(run_checks())
