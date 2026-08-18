@@ -160,6 +160,23 @@ async def run_checks() -> None:
     finally:
         main.redis_client = original_redis
 
+    original_telegram_call = main.telegram_api_call
+
+    async def no_change_telegram_call(*_args, **_kwargs):
+        return False, {"description": "Bad Request: message is not modified"}
+
+    async def failed_telegram_call(*_args, **_kwargs):
+        return False, {"description": "Bad Request: inline message not found"}
+
+    main.telegram_api_call = no_change_telegram_call
+    try:
+        assert await main.edit_inline_card("inline-card-id", "same card", {"inline_keyboard": []})
+        main.telegram_api_call = failed_telegram_call
+        assert not await main.edit_inline_card("inline-card-id", "next card", {"inline_keyboard": []})
+        print("Card guard: harmless initial no-op edits retain the tracked inline message ID.")
+    finally:
+        main.telegram_api_call = original_telegram_call
+
 
 if __name__ == "__main__":
     asyncio.run(run_checks())

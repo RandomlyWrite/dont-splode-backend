@@ -328,7 +328,7 @@ async def telegram_api_call(method: str, payload: dict) -> tuple[bool, dict]:
 
 async def edit_inline_card(inline_message_id: str, text: str, markup: dict) -> bool:
     """Edit one tracked inline card and report whether Telegram accepted the edit."""
-    ok, _ = await telegram_api_call(
+    ok, result = await telegram_api_call(
         "editMessageText",
         {
             "inline_message_id": inline_message_id,
@@ -338,7 +338,26 @@ async def edit_inline_card(inline_message_id: str, text: str, markup: dict) -> b
             "reply_markup": markup,
         },
     )
-    return ok
+    if ok:
+        return True
+
+    description = str(result.get("description", ""))
+    # The selected inline result already contains the current card. Telegram
+    # correctly rejects this first no-op edit, but the identifier is still
+    # valid and must remain tracked for the next state-changing update.
+    if "message is not modified" in description.lower():
+        return True
+
+    print(
+        "Telegram inline card edit failed",
+        json.dumps(
+            {
+                "description": description or "transport failure",
+                "inline_message_id_length": len(inline_message_id),
+            }
+        ),
+    )
+    return False
 
 
 async def refresh_lobby_cards() -> None:
@@ -354,6 +373,7 @@ async def refresh_lobby_cards() -> None:
     )
     stale_ids = [card_id for card_id, ok in zip(card_ids, outcomes) if not ok]
     if stale_ids:
+        print(f"Removing {len(stale_ids)} stale Telegram inline card(s)")
         await redis_client.srem(ACTIVE_LOBBY_CARDS_KEY, *stale_ids)
 
 
