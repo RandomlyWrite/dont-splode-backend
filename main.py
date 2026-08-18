@@ -284,6 +284,59 @@ def cache_elimination_poster(loser: dict | None, survivor_count: int) -> str:
     return poster_key
 
 
+def render_final_survivor_poster(survivor: dict | None, payout: float) -> bytes:
+    """Render the final public card with only the winning player’s public label and match outcome."""
+    public_label = public_player_label(survivor)
+    multiplier = round(float(game_state["multiplier"]), 2)
+    image = Image.new("RGBA", (POSTER_WIDTH, POSTER_HEIGHT), "#11100e")
+    draw = ImageDraw.Draw(image)
+
+    draw.rectangle((0, 0, POSTER_WIDTH, POSTER_HEIGHT), fill="#100f0d")
+    draw.rectangle((26, 26, POSTER_WIDTH - 26, POSTER_HEIGHT - 26), fill="#71511f", outline="#f1cb70", width=10)
+    draw.rectangle((62, 62, POSTER_WIDTH - 62, POSTER_HEIGHT - 62), fill="#171511", outline="#0b0a08", width=18)
+    for x, y in ((48, 48), (POSTER_WIDTH - 48, 48), (48, POSTER_HEIGHT - 48), (POSTER_WIDTH - 48, POSTER_HEIGHT - 48)):
+        draw.ellipse((x - 10, y - 10, x + 10, y + 10), fill="#3d2a0c", outline="#ffe0a0", width=3)
+
+    _center_poster_text(draw, "THE CABINET FOUND A SURVIVOR", 88, _poster_font(26), "#e1b861")
+    _center_poster_text(draw, "STILL", 132, _poster_font(102), "#f1d07b", stroke=4, stroke_fill="#281807")
+    _center_poster_text(draw, "BREATHING.", 244, _poster_font(102), "#f1d07b", stroke=4, stroke_fill="#281807")
+    survivor_font = _fit_poster_text(draw, public_label.upper(), 820, 74)
+    _center_poster_text(draw, public_label.upper(), 356, survivor_font, "#f04a40", stroke=3, stroke_fill="#260907")
+    _center_poster_text(draw, "LAST SOUL STANDING", 440, _poster_font(28), "#d9b765")
+
+    if POSTER_MASCOT_PATH.exists():
+        with Image.open(POSTER_MASCOT_PATH).convert("RGBA") as mascot_source:
+            mascot = mascot_source.copy()
+        mascot.thumbnail((720, 560), Image.Resampling.LANCZOS)
+        image.alpha_composite(mascot, ((POSTER_WIDTH - mascot.width) // 2, 482))
+    else:
+        draw.ellipse((340, 500, 740, 900), fill="#2a2822", outline="#d5aa55", width=10)
+
+    draw.rounded_rectangle((112, 1005, POSTER_WIDTH - 112, 1195), radius=18, fill="#0d0c0a", outline="#d4ae5a", width=4)
+    stats_label = _poster_font(25)
+    stats_value = _poster_font(49)
+    draw.text((158, 1045), "FINAL CRASH", font=stats_label, fill="#d2b574")
+    draw.text((158, 1085), f"{multiplier:.2f}×", font=stats_value, fill="#f1d07b")
+    draw.text((600, 1045), "SURVIVOR POT", font=stats_label, fill="#d2b574")
+    draw.text((600, 1085), f"{payout:.0f} ◉", font=stats_value, fill="#9ce58c")
+    _center_poster_text(draw, "NOT DEAD YET. DISGUSTING.", 1240, _poster_font(23), "#c9b581")
+
+    buffer = BytesIO()
+    image.convert("RGB").save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
+def cache_final_survivor_poster(survivor: dict | None, payout: float) -> str:
+    """Store the winner photo briefly while Telegram fetches the transformed final card."""
+    now = time.time()
+    expired = [key for key, (_, expires_at) in poster_cache.items() if expires_at <= now]
+    for key in expired:
+        poster_cache.pop(key, None)
+    poster_key = secrets.token_urlsafe(12)
+    poster_cache[poster_key] = (render_final_survivor_poster(survivor, payout), now + POSTER_TTL_SECONDS)
+    return poster_key
+
+
 def render_lobby_poster() -> bytes:
     """Render the first photo card so Telegram can later replace its media in place."""
     image = Image.new("RGBA", (POSTER_WIDTH, POSTER_HEIGHT), "#11100e")
@@ -645,14 +698,19 @@ async def publish_elimination_poster(loser: dict | None, survivors: list[dict]) 
 
 
 async def publish_round_results(payout: float, survivors: list[dict]) -> None:
-    """Transform live lobby cards into compact public detonation result cards."""
+    """Transform the live group card into a winner-specific final photo result."""
     card_ids = await redis_client.smembers(ACTIVE_LOBBY_CARDS_KEY)
     if not card_ids:
         return
     text, markup = current_round_result_card(payout, survivors)
-    await asyncio.gather(
-        *(edit_inline_caption(card_id, text, markup) for card_id in card_ids)
+    winner = survivors[0] if survivors else None
+    poster_key = cache_final_survivor_poster(winner, payout)
+    outcomes = await asyncio.gather(
+        *(edit_inline_media(card_id, poster_key, text, markup) for card_id in card_ids)
     )
+    stale_ids = [card_id for card_id, ok in zip(card_ids, outcomes) if not ok]
+    if stale_ids:
+        await redis_client.srem(ACTIVE_LOBBY_CARDS_KEY, *stale_ids)
     await redis_client.delete(ACTIVE_LOBBY_CARDS_KEY)
 
 
@@ -933,7 +991,6 @@ async def detonate():
             "eliminations": len(game_state["eliminated_players"]),
             "rounds": game_state["round_number"],
         }
-        await publish_elimination_poster(loser, survivors)
         await publish_round_results(payout, survivors)
         await manager.broadcast_state(
             "sploded",

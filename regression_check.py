@@ -28,6 +28,7 @@ async def run_checks() -> None:
         return amount
 
     main.refresh_lobby_cards = no_op
+    original_publish_round_results = main.publish_round_results
     main.publish_round_results = no_op
     original_publish_elimination_poster = main.publish_elimination_poster
     main.publish_elimination_poster = no_op
@@ -266,6 +267,55 @@ async def run_checks() -> None:
         assert "3.50×" in media_caption
         assert "survivor-a" not in media_caption
         print("Three-player poster test: first elimination replaced the inline photo and named the two remaining public players.")
+    finally:
+        main.redis_client = original_poster_redis
+        main.telegram_api_call = original_telegram_call
+
+    winner = {"id": "winner-private-id", "name": "Winning Name", "public_handle": "lastbreather"}
+    main.game_state["multiplier"] = 4.25
+    winner_poster = main.render_final_survivor_poster(winner, 415.0)
+    assert winner_poster.startswith(b"\x89PNG\r\n\x1a\n")
+    winner_caption, _ = main.current_round_result_card(415.0, [winner])
+    assert "@lastbreather" in winner_caption
+    assert "415.00 ◉" in winner_caption
+    assert "winner-private-id" not in winner_caption
+    assert "balance" not in winner_caption.lower()
+
+    class FinalPosterRedis:
+        def __init__(self):
+            self.deleted: list[str] = []
+
+        async def smembers(self, key):
+            return {"final-inline-card"} if key == main.ACTIVE_LOBBY_CARDS_KEY else set()
+
+        async def srem(self, *_args):
+            return 0
+
+        async def delete(self, key):
+            self.deleted.append(key)
+            return 1
+
+    final_calls: list[tuple[str, dict]] = []
+
+    async def capture_final_media(method: str, payload: dict):
+        final_calls.append((method, payload))
+        return True, {"ok": True}
+
+    final_poster_redis = FinalPosterRedis()
+    main.redis_client = final_poster_redis
+    main.telegram_api_call = capture_final_media
+    main.publish_round_results = original_publish_round_results
+    try:
+        await main.publish_round_results(415.0, [winner])
+        final_method, final_payload = final_calls[-1]
+        assert final_method == "editMessageMedia"
+        assert final_payload["inline_message_id"] == "final-inline-card"
+        final_caption = final_payload["media"]["caption"]
+        assert "@lastbreather" in final_caption
+        assert "winner-private-id" not in final_caption
+        assert final_payload["media"]["media"].startswith(f"{main.PUBLIC_BACKEND_URL}/telegram/posters/")
+        assert main.ACTIVE_LOBBY_CARDS_KEY in final_poster_redis.deleted
+        print("Final survivor poster test: winner image replaced the group card and named only the public handle.")
     finally:
         main.redis_client = original_poster_redis
         main.telegram_api_call = original_telegram_call
