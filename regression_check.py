@@ -33,6 +33,7 @@ async def run_checks() -> None:
     main.change_balance = capture_balance
     main.schedule_next_round = lambda: scheduled.append("next")
     main.schedule_lobby_reset = lambda: scheduled.append("reset")
+    print("Simulating: One → Two → Three eliminated; Four takes the final pot.")
     main.game_state.update(
         {
             "phase": "running",
@@ -40,9 +41,10 @@ async def run_checks() -> None:
                 {"id": "one", "name": "One"},
                 {"id": "two", "name": "Two"},
                 {"id": "three", "name": "Three"},
+                {"id": "four", "name": "Four"},
             ],
             "eliminated_players": [],
-            "pot": 315.0,
+            "pot": 415.0,
             "current_holder": "one",
             "multiplier": 2.5,
             "round_number": 1,
@@ -52,24 +54,43 @@ async def run_checks() -> None:
 
     await main.detonate()
     assert main.game_state["phase"] == "intermission"
-    assert [player["id"] for player in main.game_state["players"]] == ["two", "three"]
+    assert [player["id"] for player in main.game_state["players"]] == ["two", "three", "four"]
     assert [player["id"] for player in main.game_state["eliminated_players"]] == ["one"]
     assert broadcasts[-1][0] == "eliminated"
-    assert broadcasts[-1][1]["remaining_players"] == 2
+    assert broadcasts[-1][1]["remaining_players"] == 3
     assert scheduled == ["next"]
     assert balance_changes == []
+    print("Fuse 01: One eliminated; 3 active; pot carries 415.0 ◉; intermission armed.")
 
     main.game_state["phase"] = "running"
     main.game_state["current_holder"] = "two"
     main.game_state["multiplier"] = 3.25
     main.game_state["round_number"] = 2
     await main.detonate()
+    assert main.game_state["phase"] == "intermission"
+    assert [player["id"] for player in main.game_state["players"]] == ["three", "four"]
+    assert [player["id"] for player in main.game_state["eliminated_players"]] == ["one", "two"]
+    assert broadcasts[-1][0] == "eliminated"
+    assert broadcasts[-1][1]["remaining_players"] == 2
+    assert scheduled == ["next", "next"]
+    assert balance_changes == []
+    print("Fuse 02: Two eliminated; 2 active; pot carries 415.0 ◉; intermission armed.")
+
+    main.game_state["phase"] = "running"
+    main.game_state["current_holder"] = "three"
+    main.game_state["multiplier"] = 4.0
+    main.game_state["round_number"] = 3
+    await main.detonate()
     assert main.game_state["phase"] == "ended"
-    assert [player["id"] for player in main.game_state["players"]] == ["three"]
-    assert balance_changes == [("three", 315.0)]
+    assert [player["id"] for player in main.game_state["players"]] == ["four"]
+    assert [player["id"] for player in main.game_state["eliminated_players"]] == ["one", "two", "three"]
+    assert balance_changes == [("four", 415.0)]
     assert broadcasts[-1][0] == "sploded"
     assert broadcasts[-1][1]["final"] is True
-    assert scheduled[-1] == "reset"
+    assert scheduled == ["next", "next", "reset"]
+    assert main.game_state["latest_round"]["eliminations"] == 3
+    assert main.game_state["latest_round"]["rounds"] == 3
+    print("Fuse 03: Three eliminated; Four receives 415.0 ◉; final reset armed.")
 
     main.reset_round_state()
     assert main.game_state["phase"] == "lobby"
@@ -77,6 +98,7 @@ async def run_checks() -> None:
     assert main.game_state["eliminated_players"] == []
     assert main.game_state["pot"] == 0.0
     assert main.game_state["round_number"] == 0
+    print("Reset: fresh lobby; no active players; no ash record; pot 0.0 ◉.")
 
 
 if __name__ == "__main__":
