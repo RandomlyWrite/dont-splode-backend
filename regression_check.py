@@ -125,6 +125,41 @@ async def run_checks() -> None:
     assert "duplicate-user" not in session_manager.active_connections
     print("Session guard: stale duplicate closes; newer session stays authoritative.")
 
+    verified_session = FakeSocket()
+    unverified_replacement = FakeSocket()
+    await session_manager.connect(verified_session, "pit-boss", is_pit_boss=True)
+    assert "pit-boss" in session_manager.pit_boss_connections
+    await session_manager.connect(unverified_replacement, "pit-boss", is_pit_boss=False)
+    assert verified_session.closed is not None
+    assert "pit-boss" not in session_manager.pit_boss_connections
+    assert session_manager.active_connections["pit-boss"] is unverified_replacement
+    print("Role guard: unverified replacement cannot inherit a prior Pit Boss session.")
+
+    class SlotRedis:
+        def __init__(self):
+            self.keys: set[str] = set()
+
+        async def set(self, key, value, nx=False, px=None):
+            if nx and key in self.keys:
+                return False
+            self.keys.add(key)
+            return True
+
+    original_redis = main.redis_client
+    main.redis_client = SlotRedis()
+    try:
+        join_slots = await asyncio.gather(
+            *(main.claim_action_slot("racer", "join", 1.5) for _ in range(8))
+        )
+        pass_slots = await asyncio.gather(
+            *(main.claim_action_slot("holder", "pass", 0.65) for _ in range(8))
+        )
+        assert sum(join_slots) == 1
+        assert sum(pass_slots) == 1
+        print("Race guard: concurrent join and pass action slots each admit exactly one request.")
+    finally:
+        main.redis_client = original_redis
+
 
 if __name__ == "__main__":
     asyncio.run(run_checks())
