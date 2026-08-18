@@ -24,6 +24,8 @@ JOIN_COST = 100.0
 DEFAULT_BALANCE = 500.0
 JOIN_COOLDOWN_SECONDS = 1.5
 PASS_COOLDOWN_SECONDS = 0.65
+DAILY_CHIP_GRANT = 250.0
+DAILY_CLAIM_COOLDOWN_SECONDS = 24 * 60 * 60
 BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "dontsplodebot").lstrip("@")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
@@ -83,6 +85,14 @@ async def claim_action_slot(user_id: str, action: str, cooldown_seconds: float) 
     return bool(acquired)
 
 
+async def daily_claim_status(user_id: str) -> dict:
+    """Return server-owned availability and seconds until the next virtual chip claim."""
+    ttl = await redis_client.ttl(f"ds:daily_claims:{user_id}")
+    if ttl is None or ttl < 0:
+        return {"available": True, "seconds_until": 0, "amount": DAILY_CHIP_GRANT}
+    return {"available": False, "seconds_until": int(ttl), "amount": DAILY_CHIP_GRANT}
+
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: dict[str, WebSocket] = {}
@@ -105,6 +115,7 @@ class ConnectionManager:
                     "type": event_type,
                     "state": game_state,
                     "balance": await get_balance(user_id),
+                    "daily_claim": await daily_claim_status(user_id),
                     **extra,
                 }
             )
@@ -473,6 +484,29 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, user_name: str)
                 game_state["players"].append({"id": user_id, "name": user_name})
                 await refresh_lobby_cards()
                 await manager.broadcast_state("update")
+
+            elif action == "claim_daily":
+                claim_key = f"ds:daily_claims:{user_id}"
+                claimed = await redis_client.set(
+                    claim_key,
+                    "1",
+                    nx=True,
+                    ex=DAILY_CLAIM_COOLDOWN_SECONDS,
+                )
+                if not claimed:
+                    status = await daily_claim_status(user_id)
+                    await reject_action(
+                        user_id,
+                        f"The chip cache is empty. Return in {status['seconds_until']} seconds.",
+                    )
+                    continue
+
+                await change_balance(user_id, DAILY_CHIP_GRANT)
+                await manager.send_state(
+                    user_id,
+                    "daily_claimed",
+                    claim_amount=DAILY_CHIP_GRANT,
+                )
 
             elif (
                 action == "force_start"
