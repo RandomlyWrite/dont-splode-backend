@@ -26,6 +26,10 @@ JOIN_COST = 100.0
 DEFAULT_BALANCE = 500.0
 JOIN_COOLDOWN_SECONDS = 1.5
 PASS_COOLDOWN_SECONDS = 0.65
+ROUND_TICK_SECONDS = 1.5
+MINIMUM_CRASH_MULTIPLIER = 2.25
+ELIMINATION_INTERMISSION_SECONDS = 3
+FINAL_LOBBY_RESET_SECONDS = 5
 DAILY_CHIP_GRANT = 250.0
 DAILY_CLAIM_COOLDOWN_SECONDS = 24 * 60 * 60
 PIT_BOSS_DEFAULT_GRANT = 100.0
@@ -46,15 +50,18 @@ ACTIVE_LOBBY_CARDS_KEY = "ds:active_lobby_cards"
 game_state = {
     "phase": "lobby",
     "players": [],
+    "eliminated_players": [],
     "pot": 0.0,
     "current_holder": None,
     "multiplier": 1.0,
     "crash_point": 0.0,
     "hashed_seed": "",
     "server_seed": "",
+    "round_number": 0,
     "latest_round": None,
 }
 reset_task = None
+intermission_task = None
 
 
 async def get_balance(user_id: str) -> float:
@@ -185,7 +192,12 @@ def generate_crash():
     seed = secrets.token_hex(32)
     hashed = hashlib.sha256(seed.encode()).hexdigest()
     number = int(hashed[:8], 16)
-    crash = max(1.00, (2**32 / (number + 1)) * (1.0 - HOUSE_EDGE))
+    # A newly lit fuse must allow time for at least several deliberate passes.
+    # This floor applies equally to every player and does not trust any client timer.
+    crash = max(
+        MINIMUM_CRASH_MULTIPLIER,
+        (2**32 / (number + 1)) * (1.0 - HOUSE_EDGE),
+    )
     return seed, hashed, round(crash, 2)
 
 
@@ -197,10 +209,19 @@ def current_lobby_card() -> dict:
         for index, player in enumerate(players, start=1)
     ) or "No victims have signed the waiver yet."
     phase = game_state["phase"]
-    heading = "LOBBY OPEN" if phase == "lobby" else "ROUND IN PROGRESS"
+    eliminated_count = len(game_state["eliminated_players"])
+    heading = (
+        "LOBBY OPEN"
+        if phase == "lobby"
+        else "ASH SETTLING"
+        if phase == "intermission"
+        else "ROUND IN PROGRESS"
+    )
     footer = (
         "<i>Click Join. Everything lives in this one block.</i>"
         if phase == "lobby"
+        else "<i>One soul just met the fuse. The next round lights shortly.</i>"
+        if phase == "intermission"
         else "<i>The fuse is lit. Keep your hands where we can see them.</i>"
     )
     button = (
@@ -210,7 +231,9 @@ def current_lobby_card() -> dict:
         }
         if phase == "lobby"
         else {
-            "text": "🚫 LOBBY SEALED — FUSE LIT",
+            "text": "🚫 LOBBY SEALED — ASH SETTLING"
+            if phase == "intermission"
+            else "🚫 LOBBY SEALED — FUSE LIT",
             "callback_data": "lobby_closed",
         }
     )
@@ -220,8 +243,9 @@ def current_lobby_card() -> dict:
         f"<b>{heading}</b>\n\n"
         "Buy-in: <b>100 ◉</b>\n"
         "Pass fee: <b>5 ◉</b> (bled into the pot)\n\n"
-        f"<b>Players ({len(players)}/12)</b>\n"
+        f"<b>Active players ({len(players)}/12)</b>\n"
         f"{player_lines}\n\n"
+        f"<b>Eliminated: {eliminated_count}</b>\n"
         f"<b>Pot: {game_state['pot']:.0f} ◉</b>\n\n"
         f"{footer}"
     )
@@ -244,7 +268,7 @@ def current_lobby_card() -> dict:
 
 
 def current_round_result_card(payout: float, survivor_count: int) -> tuple[str, dict]:
-    """Build a compact public detonation result without private player data."""
+    """Build a compact public final-match result without private player data."""
     multiplier = round(float(game_state["multiplier"]), 2)
     survivor_label = "SOUL" if survivor_count == 1 else "SOULS"
     text = (
@@ -252,8 +276,8 @@ def current_round_result_card(payout: float, survivor_count: int) -> tuple[str, 
         "━━━━━━━━━━━━\n\n"
         "<b>THE FUSE WON.</b>\n\n"
         f"Crash: <b>{multiplier:.2f}×</b>\n"
-        f"Escaped: <b>{survivor_count} {survivor_label}</b>\n"
-        f"Survivor split: <b>{payout:.2f} ◉</b>\n\n"
+        f"Last standing: <b>{survivor_count} {survivor_label}</b>\n"
+        f"Final pot: <b>{payout:.2f} ◉</b>\n\n"
         "<i>The cabinet swept up the ash. The next lobby needs fresh volunteers.</i>"
     )
     markup = {
@@ -430,12 +454,14 @@ def reset_round_state():
         {
             "phase": "lobby",
             "players": [],
+            "eliminated_players": [],
             "pot": 0.0,
             "current_holder": None,
             "multiplier": 1.0,
             "crash_point": 0.0,
             "hashed_seed": "",
             "server_seed": "",
+            "round_number": 0,
         }
     )
 
@@ -444,7 +470,7 @@ async def reset_lobby_after_cooldown():
     """Keep an incident visible for five seconds, then open the next lobby."""
     global reset_task
     try:
-        await asyncio.sleep(5)
+        await asyncio.sleep(FINAL_LOBBY_RESET_SECONDS)
         if game_state["phase"] == "ended":
             reset_round_state()
             await manager.broadcast_state("reset")
@@ -458,14 +484,47 @@ def schedule_lobby_reset():
         reset_task = asyncio.create_task(reset_lobby_after_cooldown())
 
 
+def arm_next_round() -> None:
+    """Create a fresh server seed and bomb holder for the surviving players only."""
+    game_state["phase"] = "running"
+    (
+        game_state["server_seed"],
+        game_state["hashed_seed"],
+        game_state["crash_point"],
+    ) = generate_crash()
+    game_state["multiplier"] = 1.0
+    game_state["current_holder"] = random.choice(game_state["players"])["id"]
+    game_state["round_number"] += 1
+
+
+async def resume_after_elimination():
+    """Give the group a short visible pause before relighting the next fuse."""
+    global intermission_task
+    try:
+        await asyncio.sleep(ELIMINATION_INTERMISSION_SECONDS)
+        if game_state["phase"] != "intermission" or len(game_state["players"]) < 2:
+            return
+        arm_next_round()
+        await refresh_lobby_cards()
+        await manager.broadcast_state("next_round")
+        asyncio.create_task(tick_bomb())
+    finally:
+        intermission_task = None
+
+
+def schedule_next_round() -> None:
+    global intermission_task
+    if intermission_task is None or intermission_task.done():
+        intermission_task = asyncio.create_task(resume_after_elimination())
+
+
 async def tick_bomb():
     try:
         while game_state["phase"] == "running":
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(ROUND_TICK_SECONDS)
             game_state["multiplier"] = round(game_state["multiplier"] + 0.25, 2)
 
             if game_state["multiplier"] >= game_state["crash_point"]:
-                game_state["phase"] = "ended"
                 await detonate()
                 break
 
@@ -476,25 +535,54 @@ async def tick_bomb():
 
 async def detonate():
     loser_id = game_state["current_holder"]
+    loser = next(
+        (player for player in game_state["players"] if player["id"] == loser_id),
+        None,
+    )
     survivors = [player for player in game_state["players"] if player["id"] != loser_id]
+    game_state["players"] = survivors
+    if loser:
+        game_state["eliminated_players"].append(loser)
+    game_state["current_holder"] = None
 
+    is_final = len(survivors) <= 1
     payout = 0.0
-    if survivors:
-        payout = round(game_state["pot"] / len(survivors), 2)
-        for survivor in survivors:
-            await change_balance(survivor["id"], payout)
+    if is_final and survivors:
+        payout = round(game_state["pot"], 2)
+        await change_balance(survivors[0]["id"], payout)
 
-    # Retain a compact, identity-free ticket after the lobby reopens. Names,
-    # user IDs, seeds, and balances are intentionally excluded.
-    game_state["latest_round"] = {
-        "multiplier": round(game_state["multiplier"], 2),
-        "payout": payout,
-        "survivor_count": len(survivors),
-    }
+    if is_final:
+        # Retain only public-safe match statistics after the lobby reopens.
+        game_state["phase"] = "ended"
+        game_state["latest_round"] = {
+            "multiplier": round(game_state["multiplier"], 2),
+            "payout": payout,
+            "survivor_count": len(survivors),
+            "eliminations": len(game_state["eliminated_players"]),
+            "rounds": game_state["round_number"],
+        }
+        await publish_round_results(payout, len(survivors))
+        await manager.broadcast_state(
+            "sploded",
+            loser=loser_id,
+            loser_name=loser["name"] if loser else "UNKNOWN VICTIM",
+            payout=payout,
+            final=True,
+        )
+        schedule_lobby_reset()
+        return
 
-    await publish_round_results(payout, len(survivors))
-    await manager.broadcast_state("sploded", loser=loser_id, payout=payout)
-    schedule_lobby_reset()
+    game_state["phase"] = "intermission"
+    await refresh_lobby_cards()
+    await manager.broadcast_state(
+        "eliminated",
+        loser=loser_id,
+        loser_name=loser["name"] if loser else "UNKNOWN VICTIM",
+        payout=0.0,
+        final=False,
+        remaining_players=len(survivors),
+    )
+    schedule_next_round()
 
 
 @app.websocket("/ws/{user_id}/{user_name}")
@@ -628,14 +716,7 @@ async def websocket_endpoint(
                 and game_state["phase"] == "lobby"
                 and len(game_state["players"]) >= 2
             ):
-                game_state["phase"] = "running"
-                (
-                    game_state["server_seed"],
-                    game_state["hashed_seed"],
-                    game_state["crash_point"],
-                ) = generate_crash()
-                game_state["multiplier"] = 1.0
-                game_state["current_holder"] = random.choice(game_state["players"])["id"]
+                arm_next_round()
 
                 await refresh_lobby_cards()
                 await manager.broadcast_state("start")
