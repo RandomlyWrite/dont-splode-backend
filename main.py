@@ -28,7 +28,9 @@ JOIN_COOLDOWN_SECONDS = 1.5
 PASS_COOLDOWN_SECONDS = 0.65
 DAILY_CHIP_GRANT = 250.0
 DAILY_CLAIM_COOLDOWN_SECONDS = 24 * 60 * 60
-PIT_BOSS_GRANT = 100.0
+PIT_BOSS_DEFAULT_GRANT = 100.0
+PIT_BOSS_MIN_GRANT = 1.0
+PIT_BOSS_MAX_GRANT = 10000.0
 PIT_BOSS_GRANT_COOLDOWN_SECONDS = 1.0
 PIT_BOSS_IDS = {
     value.strip()
@@ -151,7 +153,15 @@ class ConnectionManager:
                     "balance": await get_balance(user_id),
                     "daily_claim": await daily_claim_status(user_id),
                     "pit_boss": user_id in self.pit_boss_connections,
-                    "pit_boss_grant": PIT_BOSS_GRANT if user_id in self.pit_boss_connections else 0,
+                    "pit_boss_grant": (
+                        {
+                            "default": PIT_BOSS_DEFAULT_GRANT,
+                            "min": PIT_BOSS_MIN_GRANT,
+                            "max": PIT_BOSS_MAX_GRANT,
+                        }
+                        if user_id in self.pit_boss_connections
+                        else None
+                    ),
                     **extra,
                 }
             )
@@ -565,20 +575,37 @@ async def websocket_endpoint(
                     await reject_action(user_id, "Select a currently listed victim before issuing chips.")
                     continue
 
+                try:
+                    grant_amount = float(data.get("amount"))
+                except (TypeError, ValueError):
+                    await reject_action(user_id, "Enter a whole chip amount before opening the drawer.")
+                    continue
+
+                if (
+                    not math.isfinite(grant_amount)
+                    or grant_amount != math.floor(grant_amount)
+                    or not PIT_BOSS_MIN_GRANT <= grant_amount <= PIT_BOSS_MAX_GRANT
+                ):
+                    await reject_action(
+                        user_id,
+                        f"Pit Boss grants must be whole amounts from {PIT_BOSS_MIN_GRANT:.0f} to {PIT_BOSS_MAX_GRANT:.0f} ◉.",
+                    )
+                    continue
+
                 if not await claim_action_slot(
                     user_id, "pit_boss", PIT_BOSS_GRANT_COOLDOWN_SECONDS
                 ):
                     await reject_action(user_id, "The chip drawer is already open. One moment.")
                     continue
 
-                await change_balance(target_id, PIT_BOSS_GRANT)
+                await change_balance(target_id, grant_amount)
                 await redis_client.lpush(
                     "ds:pit_boss_grants",
                     json.dumps(
                         {
                             "admin_id": user_id,
                             "recipient_id": target_id,
-                            "amount": PIT_BOSS_GRANT,
+                            "amount": grant_amount,
                             "created_at": int(time.time()),
                         }
                     ),
@@ -587,13 +614,13 @@ async def websocket_endpoint(
                 await manager.send_state(
                     target_id,
                     "pit_boss_granted",
-                    grant_amount=PIT_BOSS_GRANT,
+                    grant_amount=grant_amount,
                 )
                 if target_id != user_id:
                     await manager.send_state(
                         user_id,
                         "pit_boss_grant_sent",
-                        grant_amount=PIT_BOSS_GRANT,
+                        grant_amount=grant_amount,
                     )
 
             elif (
