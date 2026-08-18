@@ -6,8 +6,10 @@ import math
 import os
 import random
 import secrets
+import time
 from html import escape
 from urllib import request as url_request
+from urllib.parse import parse_qsl
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 import redis.asyncio as aioredis
@@ -26,6 +28,13 @@ JOIN_COOLDOWN_SECONDS = 1.5
 PASS_COOLDOWN_SECONDS = 0.65
 DAILY_CHIP_GRANT = 250.0
 DAILY_CLAIM_COOLDOWN_SECONDS = 24 * 60 * 60
+PIT_BOSS_GRANT = 100.0
+PIT_BOSS_GRANT_COOLDOWN_SECONDS = 1.0
+PIT_BOSS_IDS = {
+    value.strip()
+    for value in os.getenv("PIT_BOSS_USER_IDS", "").split(",")
+    if value.strip()
+}
 BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "dontsplodebot").lstrip("@")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
@@ -93,17 +102,42 @@ async def daily_claim_status(user_id: str) -> dict:
     return {"available": False, "seconds_until": int(ttl), "amount": DAILY_CHIP_GRANT}
 
 
+def verified_telegram_user_id(init_data: str) -> str | None:
+    """Validate Telegram Mini App init data before using it for an administrator role."""
+    if not TELEGRAM_BOT_TOKEN or not init_data:
+        return None
+    try:
+        fields = dict(parse_qsl(init_data, keep_blank_values=True))
+        supplied_hash = fields.pop("hash")
+        auth_date = int(fields.get("auth_date", "0"))
+        if abs(time.time() - auth_date) > 24 * 60 * 60:
+            return None
+        data_check_string = "\n".join(f"{key}={value}" for key, value in sorted(fields.items()))
+        secret_key = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calculated_hash, supplied_hash):
+            return None
+        user = json.loads(fields["user"])
+        return str(user["id"])
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: dict[str, WebSocket] = {}
+        self.pit_boss_connections: set[str] = set()
 
-    async def connect(self, websocket: WebSocket, user_id: str):
+    async def connect(self, websocket: WebSocket, user_id: str, is_pit_boss: bool = False):
         await websocket.accept()
         self.active_connections[user_id] = websocket
+        if is_pit_boss:
+            self.pit_boss_connections.add(user_id)
 
     def disconnect(self, user_id: str):
         if user_id in self.active_connections:
             del self.active_connections[user_id]
+        self.pit_boss_connections.discard(user_id)
 
     async def send_state(self, user_id: str, event_type: str, **extra):
         connection = self.active_connections.get(user_id)
@@ -116,6 +150,8 @@ class ConnectionManager:
                     "state": game_state,
                     "balance": await get_balance(user_id),
                     "daily_claim": await daily_claim_status(user_id),
+                    "pit_boss": user_id in self.pit_boss_connections,
+                    "pit_boss_grant": PIT_BOSS_GRANT if user_id in self.pit_boss_connections else 0,
                     **extra,
                 }
             )
@@ -452,8 +488,19 @@ async def detonate():
 
 
 @app.websocket("/ws/{user_id}/{user_name}")
-async def websocket_endpoint(websocket: WebSocket, user_id: str, user_name: str):
-    await manager.connect(websocket, user_id)
+async def websocket_endpoint(
+    websocket: WebSocket,
+    user_id: str,
+    user_name: str,
+    tg_init_data: str = "",
+):
+    verified_user_id = verified_telegram_user_id(tg_init_data)
+    is_pit_boss = bool(
+        verified_user_id
+        and verified_user_id == user_id
+        and verified_user_id in PIT_BOSS_IDS
+    )
+    await manager.connect(websocket, user_id, is_pit_boss)
     await manager.send_state(user_id, "welcome")
 
     try:
@@ -507,6 +554,47 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, user_name: str)
                     "daily_claimed",
                     claim_amount=DAILY_CHIP_GRANT,
                 )
+
+            elif action == "pit_boss_grant":
+                if user_id not in manager.pit_boss_connections:
+                    await reject_action(user_id, "Only a verified Pit Boss may open the chip drawer.")
+                    continue
+
+                target_id = str(data.get("target_id", ""))
+                if not any(player["id"] == target_id for player in game_state["players"]):
+                    await reject_action(user_id, "Select a currently listed victim before issuing chips.")
+                    continue
+
+                if not await claim_action_slot(
+                    user_id, "pit_boss", PIT_BOSS_GRANT_COOLDOWN_SECONDS
+                ):
+                    await reject_action(user_id, "The chip drawer is already open. One moment.")
+                    continue
+
+                await change_balance(target_id, PIT_BOSS_GRANT)
+                await redis_client.lpush(
+                    "ds:pit_boss_grants",
+                    json.dumps(
+                        {
+                            "admin_id": user_id,
+                            "recipient_id": target_id,
+                            "amount": PIT_BOSS_GRANT,
+                            "created_at": int(time.time()),
+                        }
+                    ),
+                )
+                await redis_client.ltrim("ds:pit_boss_grants", 0, 99)
+                await manager.send_state(
+                    target_id,
+                    "pit_boss_granted",
+                    grant_amount=PIT_BOSS_GRANT,
+                )
+                if target_id != user_id:
+                    await manager.send_state(
+                        user_id,
+                        "pit_boss_grant_sent",
+                        grant_amount=PIT_BOSS_GRANT,
+                    )
 
             elif (
                 action == "force_start"
