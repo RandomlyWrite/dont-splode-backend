@@ -30,6 +30,9 @@ ROUND_TICK_SECONDS = 1.5
 MINIMUM_CRASH_MULTIPLIER = 2.25
 ELIMINATION_INTERMISSION_SECONDS = 3
 FINAL_LOBBY_RESET_SECONDS = 5
+MAX_PLAYERS = 12
+MINIMUM_COUNTDOWN_PLAYERS = 3
+LOBBY_AUTO_IGNITE_SECONDS = 45
 DAILY_CHIP_GRANT = 250.0
 DAILY_CLAIM_COOLDOWN_SECONDS = 24 * 60 * 60
 PIT_BOSS_DEFAULT_GRANT = 100.0
@@ -59,9 +62,12 @@ game_state = {
     "server_seed": "",
     "round_number": 0,
     "latest_round": None,
+    "ready_players": [],
+    "lobby_auto_start_at": 0.0,
 }
 reset_task = None
 intermission_task = None
+lobby_ignition_task = None
 
 
 async def get_balance(user_id: str) -> float:
@@ -212,8 +218,9 @@ def generate_crash():
 def current_lobby_card() -> dict:
     """Build the public, visual announcement Telegram inserts into a selected chat."""
     players = game_state["players"]
+    ready_players = {str(user_id) for user_id in game_state.get("ready_players", [])}
     player_lines = "\n".join(
-        f"{index}. {escape(str(player['name']))}"
+        f"{index}. {escape(str(player['name']))} {'<b>— LIT</b>' if str(player['id']) in ready_players else '— waiting'}"
         for index, player in enumerate(players, start=1)
     ) or "No victims have signed the waiver yet."
     phase = game_state["phase"]
@@ -225,8 +232,16 @@ def current_lobby_card() -> dict:
         if phase == "intermission"
         else "ROUND IN PROGRESS"
     )
+    ready_count = sum(str(player["id"]) in ready_players for player in players)
+    countdown_at = float(game_state.get("lobby_auto_start_at") or 0)
+    seconds_until_auto = max(0, math.ceil(countdown_at - time.time())) if countdown_at else 0
     footer = (
-        "<i>Click Join. Everything lives in this one block.</i>"
+        (
+            f"<i>Hold LIGHT IT UP together ({ready_count}/{len(players)} ready). "
+            f"Auto-ignition in {seconds_until_auto}s.</i>"
+            if countdown_at
+            else f"<i>Hold LIGHT IT UP together ({ready_count}/{len(players)} ready). Full lobby ignites immediately.</i>"
+        )
         if phase == "lobby"
         else "<i>One soul just met the fuse. The next round lights shortly.</i>"
         if phase == "intermission"
@@ -251,7 +266,7 @@ def current_lobby_card() -> dict:
         f"<b>{heading}</b>\n\n"
         "Buy-in: <b>100 ◉</b>\n"
         "Pass fee: <b>5 ◉</b> (bled into the pot)\n\n"
-        f"<b>Active players ({len(players)}/12)</b>\n"
+        f"<b>Active players ({len(players)}/{MAX_PLAYERS})</b>\n"
         f"{player_lines}\n\n"
         f"<b>Eliminated: {eliminated_count}</b>\n"
         f"<b>Pot: {game_state['pot']:.0f} ◉</b>\n\n"
@@ -490,6 +505,8 @@ def reset_round_state():
             "hashed_seed": "",
             "server_seed": "",
             "round_number": 0,
+            "ready_players": [],
+            "lobby_auto_start_at": 0.0,
         }
     )
 
@@ -523,6 +540,65 @@ def arm_next_round() -> None:
     game_state["multiplier"] = 1.0
     game_state["current_holder"] = random.choice(game_state["players"])["id"]
     game_state["round_number"] += 1
+    game_state["ready_players"] = []
+    game_state["lobby_auto_start_at"] = 0.0
+
+
+def lobby_player_ids() -> set[str]:
+    return {str(player["id"]) for player in game_state["players"]}
+
+
+def all_lobby_players_are_ready() -> bool:
+    player_ids = lobby_player_ids()
+    ready_ids = {str(user_id) for user_id in game_state.get("ready_players", [])}
+    return len(player_ids) >= 2 and player_ids.issubset(ready_ids)
+
+
+async def ignite_lobby(reason: str) -> bool:
+    """Start one lobby only after a server-owned ignition condition is satisfied."""
+    if game_state["phase"] != "lobby" or len(game_state["players"]) < 2:
+        return False
+    arm_next_round()
+    await refresh_lobby_cards()
+    await manager.broadcast_state("start", ignition_reason=reason)
+    asyncio.create_task(tick_bomb())
+    return True
+
+
+async def maybe_ignite_lobby() -> bool:
+    """Apply all readiness, full-lobby, and countdown ignition rules atomically."""
+    if game_state["phase"] != "lobby":
+        return False
+    player_count = len(game_state["players"])
+    if player_count >= MAX_PLAYERS:
+        return await ignite_lobby("full_lobby")
+    if all_lobby_players_are_ready():
+        return await ignite_lobby("all_ready")
+    auto_start_at = float(game_state.get("lobby_auto_start_at") or 0)
+    if player_count >= MINIMUM_COUNTDOWN_PLAYERS and auto_start_at and time.time() >= auto_start_at:
+        return await ignite_lobby("lobby_countdown")
+    return False
+
+
+async def watch_lobby_ignition() -> None:
+    """Wake at the lobby timeout while still allowing unanimous ready to light instantly."""
+    global lobby_ignition_task
+    try:
+        while game_state["phase"] == "lobby":
+            if await maybe_ignite_lobby():
+                return
+            auto_start_at = float(game_state.get("lobby_auto_start_at") or 0)
+            if not auto_start_at:
+                return
+            await asyncio.sleep(min(1.0, max(0.1, auto_start_at - time.time())))
+    finally:
+        lobby_ignition_task = None
+
+
+def schedule_lobby_ignition() -> None:
+    global lobby_ignition_task
+    if lobby_ignition_task is None or lobby_ignition_task.done():
+        lobby_ignition_task = asyncio.create_task(watch_lobby_ignition())
 
 
 async def resume_after_elimination():
@@ -658,8 +734,38 @@ async def websocket_endpoint(
                 await change_balance(user_id, -JOIN_COST)
                 game_state["pot"] += JOIN_COST
                 game_state["players"].append({"id": user_id, "name": user_name})
-                await refresh_lobby_cards()
-                await manager.broadcast_state("update")
+                if (
+                    len(game_state["players"]) >= MINIMUM_COUNTDOWN_PLAYERS
+                    and not game_state.get("lobby_auto_start_at")
+                ):
+                    game_state["lobby_auto_start_at"] = time.time() + LOBBY_AUTO_IGNITE_SECONDS
+                    schedule_lobby_ignition()
+                if not await maybe_ignite_lobby():
+                    await refresh_lobby_cards()
+                    await manager.broadcast_state("update")
+
+            elif action == "light_it_up":
+                if game_state["phase"] != "lobby":
+                    await reject_action(user_id, "The fuse is already lit. Keep your hands off the matchbook.")
+                    continue
+                if user_id not in lobby_player_ids():
+                    await reject_action(user_id, "Sign the waiver before trying to light anything.")
+                    continue
+                ready_players = {str(player_id) for player_id in game_state.get("ready_players", [])}
+                if user_id not in ready_players:
+                    ready_players.add(user_id)
+                    game_state["ready_players"] = sorted(ready_players)
+                if not await maybe_ignite_lobby():
+                    await refresh_lobby_cards()
+                    await manager.broadcast_state("ready_changed")
+
+            elif action == "cool_it_down":
+                ready_players = {str(player_id) for player_id in game_state.get("ready_players", [])}
+                if user_id in ready_players and game_state["phase"] == "lobby":
+                    ready_players.discard(user_id)
+                    game_state["ready_players"] = sorted(ready_players)
+                    await refresh_lobby_cards()
+                    await manager.broadcast_state("ready_changed")
 
             elif action == "claim_daily":
                 claim_key = f"ds:daily_claims:{user_id}"
@@ -742,16 +848,11 @@ async def websocket_endpoint(
                         grant_amount=grant_amount,
                     )
 
-            elif (
-                action == "force_start"
-                and game_state["phase"] == "lobby"
-                and len(game_state["players"]) >= 2
-            ):
-                arm_next_round()
-
-                await refresh_lobby_cards()
-                await manager.broadcast_state("start")
-                asyncio.create_task(tick_bomb())
+            elif action == "force_start":
+                await reject_action(
+                    user_id,
+                    "The cabinet lights only when every victim holds LIGHT IT UP, the lobby fills, or three victims wait 45 seconds.",
+                )
 
             elif action == "pass" and game_state["phase"] == "running":
                 if game_state["current_holder"] == user_id:

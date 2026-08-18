@@ -177,6 +177,71 @@ async def run_checks() -> None:
     finally:
         main.telegram_api_call = original_telegram_call
 
+    ignition_ticks: list[str] = []
+    original_tick_bomb = main.tick_bomb
+
+    async def fake_tick_bomb():
+        ignition_ticks.append("tick")
+
+    main.tick_bomb = fake_tick_bomb
+    try:
+        def lobby_players(count: int) -> list[dict]:
+            return [{"id": f"ready-{index}", "name": f"Ready {index}"} for index in range(count)]
+
+        main.game_state.update(
+            {
+                "phase": "lobby",
+                "players": lobby_players(2),
+                "eliminated_players": [],
+                "ready_players": ["ready-0"],
+                "lobby_auto_start_at": 0.0,
+                "pot": 200.0,
+                "round_number": 0,
+            }
+        )
+        assert not await main.maybe_ignite_lobby()
+        main.game_state["ready_players"] = ["ready-0", "ready-1"]
+        assert await main.maybe_ignite_lobby()
+        assert main.game_state["phase"] == "running"
+        assert broadcasts[-1][0] == "start"
+        assert broadcasts[-1][1]["ignition_reason"] == "all_ready"
+        await asyncio.sleep(0)
+        assert ignition_ticks == ["tick"]
+        print("Ignition guard: two-player lobby lights only when every signed player holds LIGHT IT UP.")
+
+        main.game_state.update(
+            {
+                "phase": "lobby",
+                "players": lobby_players(main.MAX_PLAYERS),
+                "ready_players": [],
+                "lobby_auto_start_at": 0.0,
+                "round_number": 0,
+            }
+        )
+        assert await main.maybe_ignite_lobby()
+        assert broadcasts[-1][1]["ignition_reason"] == "full_lobby"
+        print("Ignition guard: a full twelve-player lobby lights without requiring readiness holds.")
+
+        main.game_state.update(
+            {
+                "phase": "lobby",
+                "players": lobby_players(3),
+                "ready_players": [],
+                "lobby_auto_start_at": main.time.time() - 1,
+                "round_number": 0,
+            }
+        )
+        assert await main.maybe_ignite_lobby()
+        assert broadcasts[-1][1]["ignition_reason"] == "lobby_countdown"
+        print("Ignition guard: a three-player lobby lights after its 45-second server countdown expires.")
+
+        main.reset_round_state()
+        assert main.game_state["ready_players"] == []
+        assert main.game_state["lobby_auto_start_at"] == 0.0
+        print("Reset guard: lobby readiness and auto-ignite countdown do not leak into the next match.")
+    finally:
+        main.tick_bomb = original_tick_bomb
+
 
 if __name__ == "__main__":
     asyncio.run(run_checks())
