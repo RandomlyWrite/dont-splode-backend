@@ -4,6 +4,7 @@ Run with: python3 regression_check.py
 """
 
 import asyncio
+import json
 
 import main
 
@@ -440,6 +441,7 @@ async def run_checks() -> None:
         def __init__(self):
             self.hashes: dict[str, dict[str, str]] = {}
             self.lists: dict[str, list[str]] = {}
+            self.values: dict[str, str] = {}
 
         def pipeline(self, transaction=True):
             return LedgerPipeline(self)
@@ -453,6 +455,13 @@ async def run_checks() -> None:
 
         async def hgetall(self, key):
             return dict(self.hashes.get(key, {}))
+
+        async def get(self, key):
+            return self.values.get(key)
+
+        async def set(self, key, value, **_kwargs):
+            self.values[key] = str(value)
+            return True
 
         async def lpush(self, key, value):
             self.lists.setdefault(key, []).insert(0, str(value))
@@ -549,6 +558,47 @@ async def run_checks() -> None:
         assert group_board["entries"][0]["pot_won"] == 650.0
         assert len(group_board["entries"]) == 3 and "leader-alpha" not in str(group_board)
         assert (await main.public_leaderboard_payload("leader-alpha", "competitive", "bad-group-ref"))["scope"] == "global"
+        current_season = await main.group_season_archive_payload(group["ref"])
+        assert current_season["available"] is True and current_season["current"]["entries"][0]["name"] == "Beta"
+        old_week = "2020-W01"
+        old_key = f"{main.GROUP_SEASON_CURRENT_PREFIX}{group['ref']}:{old_week}"
+        await ledger_redis.hset(old_key, "leader-beta", json.dumps({"name": "Beta", "public_handle": "beta_soul", "matches_entered": 2, "matches_survived": 2, "total_pot_won": 400}))
+        await ledger_redis.set(f"{main.GROUP_SEASON_CURRENT_PREFIX}{group['ref']}", old_week)
+        rolled_season = await main.group_season_archive_payload(group["ref"])
+        assert rolled_season["archives"] and rolled_season["archives"][0]["winner"]["name"] == "Beta"
+        leaderboard_message = await main.group_leaderboard_message(group)
+        assert "GROUP LEADERBOARD" in leaderboard_message and "@beta_soul" in leaderboard_message and "-100123" not in leaderboard_message
+        health_message = await main.pit_boss_health_message()
+        assert "CABINET HEALTH" in health_message and "-100123" not in health_message and "leader-alpha" not in health_message
+        class WebhookRequest:
+            def __init__(self, update):
+                self.update = update
+
+            async def json(self):
+                return self.update
+
+        original_webhook_secret = main.TELEGRAM_WEBHOOK_SECRET
+        original_pit_boss_ids = set(main.PIT_BOSS_IDS)
+        main.TELEGRAM_WEBHOOK_SECRET = "regression-webhook-secret"
+        main.PIT_BOSS_IDS.add("pit-boss")
+        try:
+            command_base = {"chat": {"id": -100123, "type": "supergroup"}, "from": {"id": "ordinary-user"}}
+            in_chat_board = await main.telegram_webhook(WebhookRequest({"message": {**command_base, "text": "/leaderboard"}}), "regression-webhook-secret")
+            assert in_chat_board["method"] == "sendMessage" and "@beta_soul" in in_chat_board["text"] and "-100123" not in in_chat_board["text"]
+            denied_health = await main.telegram_webhook(WebhookRequest({"message": {**command_base, "text": "/dont_splode_health"}}), "regression-webhook-secret")
+            assert "reserved for the Pit Boss" in denied_health["text"]
+            allowed_health = await main.telegram_webhook(WebhookRequest({"message": {"chat": {"id": 9, "type": "private"}, "from": {"id": "pit-boss"}, "text": "/dont_splode_health"}}), "regression-webhook-secret")
+            assert "CABINET HEALTH" in allowed_health["text"] and "-100123" not in allowed_health["text"]
+        finally:
+            main.TELEGRAM_WEBHOOK_SECRET = original_webhook_secret
+            main.PIT_BOSS_IDS.clear()
+            main.PIT_BOSS_IDS.update(original_pit_boss_ids)
+        spectator_socket = FakeSocket()
+        spectator_manager = main.ConnectionManager()
+        await spectator_manager.connect(spectator_socket, "spectator-user", group_ref=group["ref"], spectator=True)
+        assert spectator_manager.spectator_contexts["spectator-user"] is True and spectator_manager.group_contexts["spectator-user"] == group["ref"]
+        spectator_manager.disconnect("spectator-user", spectator_socket)
+        assert "spectator-user" not in spectator_manager.spectator_contexts
         native_card_calls: list[tuple[str, dict]] = []
 
         async def capture_native_card(method: str, payload: dict):
@@ -562,6 +612,13 @@ async def run_checks() -> None:
         assert native_card_calls[0][0] == "sendPhoto"
         group_launch_url = native_card_calls[0][1]["reply_markup"]["inline_keyboard"][0][0]["url"]
         assert f"startapp=join_{group['ref']}" in group_launch_url and "-100123" not in group_launch_url
+        main.game_state["phase"] = "running"
+        watch_card = main.current_lobby_card(group["ref"])
+        watch_url = watch_card["reply_markup"]["inline_keyboard"][0][0]["url"]
+        assert f"startapp=watch_{group['ref']}" in watch_url and "-100123" not in watch_url
+        _, elimination_watch_markup = main.current_elimination_card({"name": "QA Loser"}, [{"name": "QA Winner"}], group["ref"])
+        assert f"startapp=watch_{group['ref']}" in elimination_watch_markup["inline_keyboard"][0][0]["url"]
+        main.game_state["phase"] = "lobby"
         assert await main.edit_group_media("-100123", 77, "elimination-qa", "Public result", {"inline_keyboard": []})
         assert native_card_calls[-1][0] == "editMessageMedia"
         assert native_card_calls[-1][1]["media"]["media"].endswith("/elimination-qa.png")

@@ -8,6 +8,7 @@ import random
 import re
 import secrets
 import time
+from datetime import datetime, timezone
 from html import escape
 from io import BytesIO
 from pathlib import Path
@@ -33,9 +34,12 @@ ADMIN_LEDGER_KEY = "ds:admin_ledger"
 REGISTERED_GROUPS_KEY = "ds:registered_groups"
 ACTIVE_GROUP_CARDS_KEY = "ds:active_group_cards"
 GROUP_COMPETITIVE_PREFIX = "ds:group_competitive:"
+GROUP_SEASON_CURRENT_PREFIX = "ds:group_season_current:"
+GROUP_SEASON_ARCHIVE_PREFIX = "ds:group_season_archives:"
 PLAYER_LEDGER_LIMIT = 1000
 ADMIN_LEDGER_LIMIT = 10000
 LEADERBOARD_LIMIT = 10
+GROUP_SEASON_ARCHIVE_LIMIT = 12
 
 HOUSE_EDGE = 0.03
 PASS_FEE = 5.0
@@ -182,33 +186,150 @@ async def group_is_registered(group_ref: str) -> bool:
     return False
 
 
+def utc_week_id(timestamp: float | None = None) -> str:
+    """Return the stable ISO week identifier used for group season windows."""
+    stamp = datetime.fromtimestamp(float(timestamp or time.time()), timezone.utc)
+    iso = stamp.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+def ranked_season_rows(records: list[dict]) -> list[dict]:
+    """Rank only public-safe competitive values for a group season or archive."""
+    eligible = [record for record in records if int(record.get("matches_entered", 0) or 0) > 0]
+    eligible.sort(
+        key=lambda record: (
+            -int(record.get("matches_survived", 0) or 0),
+            -float(record.get("total_pot_won", 0) or 0),
+            clean_profile_name(record.get("name")).lower(),
+        )
+    )
+    rows: list[dict] = []
+    for rank, record in enumerate(eligible, start=1):
+        rows.append(
+            {
+                "rank": rank,
+                "name": clean_profile_name(record.get("name")),
+                "public_handle": clean_public_handle(record.get("public_handle")),
+                "survivals": max(0, int(record.get("matches_survived", 0) or 0)),
+                "pot_won": max(0.0, round(float(record.get("total_pot_won", 0) or 0), 2)),
+                "matches": max(0, int(record.get("matches_entered", 0) or 0)),
+            }
+        )
+    return rows
+
+
+async def group_season_records(group_ref: str, week_id: str) -> list[dict]:
+    """Load one week of safe per-group competitive rows without returning player IDs."""
+    safe_ref = clean_group_ref(group_ref)
+    if not safe_ref or not re.fullmatch(r"\d{4}-W\d{2}", str(week_id)):
+        return []
+    records: list[dict] = []
+    for raw_entry in (await redis_client.hgetall(f"{GROUP_SEASON_CURRENT_PREFIX}{safe_ref}:{week_id}")).values():
+        try:
+            record = json.loads(raw_entry)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+async def archive_group_season(group_ref: str, week_id: str) -> None:
+    """Freeze a compact public-safe season result once, retaining only the bounded honor docket."""
+    safe_ref = clean_group_ref(group_ref)
+    rows = ranked_season_rows(await group_season_records(safe_ref, week_id))
+    if not safe_ref or not rows:
+        return
+    snapshot = {
+        "week": week_id,
+        "settled_at": int(time.time()),
+        "winner": rows[0] if rows[0]["survivals"] > 0 else None,
+        "entries": rows[:LEADERBOARD_LIMIT],
+    }
+    await redis_client.lpush(f"{GROUP_SEASON_ARCHIVE_PREFIX}{safe_ref}", json.dumps(snapshot, separators=(",", ":")))
+    await redis_client.ltrim(f"{GROUP_SEASON_ARCHIVE_PREFIX}{safe_ref}", 0, GROUP_SEASON_ARCHIVE_LIMIT - 1)
+
+
+async def ensure_current_group_season(group_ref: str) -> str:
+    """Roll a registered group forward on first activity or inspection after a UTC week boundary."""
+    safe_ref = clean_group_ref(group_ref)
+    if not safe_ref or not await group_is_registered(safe_ref):
+        return ""
+    current_week = utc_week_id()
+    state_key = f"{GROUP_SEASON_CURRENT_PREFIX}{safe_ref}"
+    prior_week = str(await redis_client.get(state_key) or "")
+    if prior_week and prior_week != current_week:
+        await archive_group_season(safe_ref, prior_week)
+    if prior_week != current_week:
+        await redis_client.set(state_key, current_week)
+    return current_week
+
+
+async def group_season_archive_payload(group_ref: str) -> dict:
+    """Return the current weekly docket plus bounded historical winners without internal identifiers."""
+    safe_ref = clean_group_ref(group_ref)
+    if not await group_is_registered(safe_ref):
+        return {"available": False, "current": None, "archives": []}
+    current_week = await ensure_current_group_season(safe_ref)
+    current_rows = ranked_season_rows(await group_season_records(safe_ref, current_week))
+    archives: list[dict] = []
+    for raw_snapshot in await redis_client.lrange(f"{GROUP_SEASON_ARCHIVE_PREFIX}{safe_ref}", 0, GROUP_SEASON_ARCHIVE_LIMIT - 1):
+        try:
+            snapshot = json.loads(raw_snapshot)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(snapshot, dict):
+            continue
+        winner = snapshot.get("winner") if isinstance(snapshot.get("winner"), dict) else None
+        entries = snapshot.get("entries") if isinstance(snapshot.get("entries"), list) else []
+        archives.append(
+            {
+                "week": str(snapshot.get("week", ""))[:10],
+                "winner": winner,
+                "entries": [entry for entry in entries[:LEADERBOARD_LIMIT] if isinstance(entry, dict)],
+            }
+        )
+    return {
+        "available": True,
+        "current": {
+            "week": current_week,
+            "winner": current_rows[0] if current_rows and current_rows[0]["survivals"] > 0 else None,
+            "entries": current_rows[:LEADERBOARD_LIMIT],
+        },
+        "archives": archives,
+    }
+
+
 async def record_group_match_results(group_ref: str, participant_ids: set[str], winner_id: str, payout: float) -> None:
     """Append only safe, per-group competitive totals for players who entered via that group’s signed lobby card."""
     safe_ref = clean_group_ref(group_ref)
     if not participant_ids or not await group_is_registered(safe_ref):
         return
     key = f"{GROUP_COMPETITIVE_PREFIX}{safe_ref}"
+    current_week = await ensure_current_group_season(safe_ref)
+    season_key = f"{GROUP_SEASON_CURRENT_PREFIX}{safe_ref}:{current_week}"
     for participant_id in sorted({str(value) for value in participant_ids}):
         profile = await load_player_profile(participant_id)
         if profile is None:
             profile = await ensure_player_profile(participant_id)
         if profile is None:
             continue
-        try:
-            existing = json.loads(await redis_client.hget(key, participant_id) or "{}")
-        except (TypeError, json.JSONDecodeError):
-            existing = {}
-        existing.update(
-            {
-                "name": clean_profile_name(profile.get("name")),
-                "public_handle": clean_public_handle(profile.get("public_handle")),
-                "matches_entered": int(existing.get("matches_entered", 0) or 0) + 1,
-                "matches_survived": int(existing.get("matches_survived", 0) or 0) + (1 if participant_id == str(winner_id) else 0),
-                "total_pot_won": round(float(existing.get("total_pot_won", 0) or 0) + (float(payout) if participant_id == str(winner_id) else 0.0), 2),
-                "balance": await get_balance(participant_id),
-            }
-        )
-        await redis_client.hset(key, participant_id, json.dumps(existing, separators=(",", ":")))
+        for target_key in (key, season_key):
+            try:
+                existing = json.loads(await redis_client.hget(target_key, participant_id) or "{}")
+            except (TypeError, json.JSONDecodeError):
+                existing = {}
+            existing.update(
+                {
+                    "name": clean_profile_name(profile.get("name")),
+                    "public_handle": clean_public_handle(profile.get("public_handle")),
+                    "matches_entered": int(existing.get("matches_entered", 0) or 0) + 1,
+                    "matches_survived": int(existing.get("matches_survived", 0) or 0) + (1 if participant_id == str(winner_id) else 0),
+                    "total_pot_won": round(float(existing.get("total_pot_won", 0) or 0) + (float(payout) if participant_id == str(winner_id) else 0.0), 2),
+                    "balance": await get_balance(participant_id),
+                }
+            )
+            await redis_client.hset(target_key, participant_id, json.dumps(existing, separators=(",", ":")))
 
 
 async def public_leaderboard_payload(user_id: str, view: str = "competitive", group_ref: str = "") -> dict:
@@ -603,6 +724,76 @@ async def touch_registered_group(group_ref: str, field: str) -> None:
         return
 
 
+async def registered_group_for_chat(chat_id: str) -> dict | None:
+    """Resolve a Telegram group only inside the trusted webhook boundary."""
+    safe_chat_id = str(chat_id or "")
+    if not safe_chat_id:
+        return None
+    raw = await redis_client.hget(REGISTERED_GROUPS_KEY, safe_chat_id)
+    try:
+        group = json.loads(raw) if raw else None
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(group, dict) or not clean_group_ref(group.get("ref")):
+        return None
+    return {"chat_id": safe_chat_id, **group}
+
+
+def leaderboard_label(row: dict) -> str:
+    """Format the single public identity a group may see on a leaderboard line."""
+    handle = clean_public_handle(row.get("public_handle"))
+    return f"@{handle}" if handle else escape(clean_profile_name(row.get("name")))
+
+
+async def group_leaderboard_message(group: dict) -> str:
+    """Render compact group standings for Telegram without a member roster or internal identifiers."""
+    board = await public_leaderboard_payload("", "competitive", str(group.get("ref", "")))
+    entries = list(board.get("entries") or [])[:LEADERBOARD_LIMIT]
+    title = escape(clean_profile_name(group.get("title"), "THIS CABINET"))
+    if not entries:
+        standings = "<i>No final survivor is on file yet. Light the fuse and make history.</i>"
+    else:
+        standings = "\n".join(
+            f"<b>{row['rank']:02d}.</b> {leaderboard_label(row)} — {int(row.get('survivals', 0) or 0)} survived • {float(row.get('pot_won', 0) or 0):.0f} ◉ won"
+            for row in entries
+        )
+    return (
+        "💣 <b>DON'T SPLODE — GROUP LEADERBOARD</b> 💣\n"
+        "━━━━━━━━━━━━\n\n"
+        f"<b>{title}</b> • ALL TIME\n\n"
+        f"{standings}\n\n"
+        "<i>Final survivals first. Cumulative virtual pots break the tie.</i>"
+    )
+
+
+async def pit_boss_health_message() -> str:
+    """Return an administrator-only operational summary with no player or chat identifiers."""
+    try:
+        registered_groups = len(await redis_client.hgetall(REGISTERED_GROUPS_KEY))
+        active_cards = len(await redis_client.hgetall(ACTIVE_GROUP_CARDS_KEY))
+        ledger_status = "NOMINAL"
+    except Exception:
+        registered_groups = 0
+        active_cards = 0
+        ledger_status = "DEGRADED"
+    phase = str(game_state.get("phase", "lobby")).upper()
+    active_players = len(game_state.get("players") or [])
+    eliminated = len(game_state.get("eliminated_players") or [])
+    spectators = max(0, len(manager.active_connections) - active_players)
+    return (
+        "🛠 <b>DON'T SPLODE — CABINET HEALTH</b>\n"
+        "━━━━━━━━━━━━\n\n"
+        f"Ledger: <b>{ledger_status}</b>\n"
+        f"Phase: <b>{phase}</b>\n"
+        f"Active players: <b>{active_players}</b>\n"
+        f"Spectator sessions: <b>{spectators}</b>\n"
+        f"Ash on file: <b>{eliminated}</b>\n"
+        f"Group cabinets: <b>{registered_groups}</b>\n"
+        f"Tracked live cards: <b>{active_cards}</b>\n\n"
+        "<i>Operational summary only. No player or chat identifiers are exposed.</i>"
+    )
+
+
 def verified_telegram_context(init_data: str) -> tuple[dict, str] | None:
     """Return verified Telegram user data and its signed Mini App start parameter."""
     if not TELEGRAM_BOT_TOKEN or not init_data:
@@ -858,14 +1049,16 @@ class ConnectionManager:
         self.leaderboard_views: dict[str, str] = {}
         self.leaderboard_scopes: dict[str, str] = {}
         self.group_contexts: dict[str, str] = {}
+        self.spectator_contexts: dict[str, bool] = {}
 
-    async def connect(self, websocket: WebSocket, user_id: str, is_pit_boss: bool = False, group_ref: str = ""):
+    async def connect(self, websocket: WebSocket, user_id: str, is_pit_boss: bool = False, group_ref: str = "", spectator: bool = False):
         await websocket.accept()
         previous_connection = self.active_connections.get(user_id)
         self.active_connections[user_id] = websocket
         self.leaderboard_views.setdefault(user_id, "competitive")
         self.group_contexts[user_id] = clean_group_ref(group_ref)
         self.leaderboard_scopes[user_id] = self.group_contexts[user_id]
+        self.spectator_contexts[user_id] = bool(spectator)
         if is_pit_boss:
             self.pit_boss_connections.add(user_id)
         else:
@@ -883,12 +1076,19 @@ class ConnectionManager:
             self.leaderboard_views.pop(user_id, None)
             self.leaderboard_scopes.pop(user_id, None)
             self.group_contexts.pop(user_id, None)
+            self.spectator_contexts.pop(user_id, None)
 
     async def send_state(self, user_id: str, event_type: str, **extra):
         connection = self.active_connections.get(user_id)
         if connection is None:
             return
         try:
+            group_ref = self.group_contexts.get(user_id, "")
+            group_seasons = (
+                await group_season_archive_payload(group_ref)
+                if group_ref and event_type in {"welcome", "sploded", "season_archive"}
+                else None
+            )
             await connection.send_json(
                 {
                     "type": event_type,
@@ -901,6 +1101,8 @@ class ConnectionManager:
                         self.leaderboard_scopes.get(user_id, ""),
                     ),
                     "group_context_available": bool(self.group_contexts.get(user_id)),
+                    "spectator_mode": bool(self.spectator_contexts.get(user_id)),
+                    "group_seasons": group_seasons,
                     "pit_boss": user_id in self.pit_boss_connections,
                     "pit_boss_grant": (
                         {
@@ -981,6 +1183,7 @@ def current_lobby_card(group_ref: str = "") -> dict:
     )
     safe_group_ref = clean_group_ref(group_ref)
     start_param = f"join_{safe_group_ref}" if safe_group_ref else "join"
+    watch_param = f"watch_{safe_group_ref}" if safe_group_ref else "watch"
     button = (
         {
             "text": "JOIN THE LOBBY — 100 ◉",
@@ -988,10 +1191,10 @@ def current_lobby_card(group_ref: str = "") -> dict:
         }
         if phase == "lobby"
         else {
-            "text": "🚫 LOBBY SEALED — ASH SETTLING"
+            "text": "👁 WATCH THE ASH SETTLE"
             if phase == "intermission"
-            else "🚫 LOBBY SEALED — FUSE LIT",
-            "callback_data": "lobby_closed",
+            else "👁 WATCH THE FUSE LIVE",
+            "url": f"https://t.me/{BOT_USERNAME}?startapp={watch_param}",
         }
     )
     text = (
@@ -1029,7 +1232,7 @@ def public_remaining_players_caption(players: list[dict]) -> str:
     return " • ".join(labels) if labels else "Nobody. The cabinet got hungry."
 
 
-def current_round_result_card(payout: float, survivors: list[dict]) -> tuple[str, dict]:
+def current_round_result_card(payout: float, survivors: list[dict], group_ref: str = "") -> tuple[str, dict]:
     """Build a compact public final-match result without private player data."""
     multiplier = round(float(game_state["multiplier"]), 2)
     survivor_count = len(survivors)
@@ -1044,12 +1247,14 @@ def current_round_result_card(payout: float, survivors: list[dict]) -> tuple[str
         f"Final pot: <b>{payout:.2f} ◉</b>\n\n"
         "<i>The cabinet swept up the ash. The next lobby needs fresh volunteers.</i>"
     )
+    safe_group_ref = clean_group_ref(group_ref)
+    start_param = f"watch_{safe_group_ref}" if safe_group_ref else "watch"
     markup = {
         "inline_keyboard": [
             [
                 {
-                    "text": "OPEN THE CABINET",
-                    "url": f"https://t.me/{BOT_USERNAME}?startapp=join",
+                    "text": "VIEW THE CABINET RECORD",
+                    "url": f"https://t.me/{BOT_USERNAME}?startapp={start_param}",
                 }
             ]
         ]
@@ -1057,7 +1262,7 @@ def current_round_result_card(payout: float, survivors: list[dict]) -> tuple[str
     return text, markup
 
 
-def current_elimination_card(loser: dict | None, survivors: list[dict]) -> tuple[str, dict]:
+def current_elimination_card(loser: dict | None, survivors: list[dict], group_ref: str = "") -> tuple[str, dict]:
     """Build the caption and sealed-lobby control for a public elimination poster."""
     victim = escape(public_player_label(loser))
     multiplier = round(float(game_state["multiplier"]), 2)
@@ -1071,9 +1276,9 @@ def current_elimination_card(loser: dict | None, survivors: list[dict]) -> tuple
         f"<b>Remaining with a pulse:</b> {remaining_players}\n\n"
         "<i>The cabinet has accepted a fresh contribution to the ash pile.</i>"
     )
-    markup = {
-        "inline_keyboard": [[{"text": "🚫 LOBBY SEALED — ASH SETTLING", "callback_data": "lobby_closed"}]]
-    }
+    safe_group_ref = clean_group_ref(group_ref)
+    start_param = f"watch_{safe_group_ref}" if safe_group_ref else "watch"
+    markup = {"inline_keyboard": [[{"text": "👁 WATCH THE NEXT FUSE", "url": f"https://t.me/{BOT_USERNAME}?startapp={start_param}"}]]}
     return text, markup
 
 
@@ -1427,9 +1632,26 @@ async def telegram_webhook(
     message = update.get("message") or {}
     chat = message.get("chat") or {}
     command = str(message.get("text") or "").strip().split(maxsplit=1)[0].lower()
+    chat_id = str(chat.get("id", ""))
+    actor_id = str((message.get("from") or {}).get("id", ""))
+    if command.startswith("/dont_splode_health"):
+        if actor_id not in PIT_BOSS_IDS:
+            return {
+                "method": "sendMessage",
+                "chat_id": chat_id,
+                "text": "That diagnostic hatch is reserved for the Pit Boss.",
+            }
+        return {"method": "sendMessage", "chat_id": chat_id, "text": await pit_boss_health_message(), "parse_mode": "HTML"}
+    if command.startswith("/leaderboard"):
+        group = await registered_group_for_chat(chat_id)
+        if not group:
+            return {
+                "method": "sendMessage",
+                "chat_id": chat_id,
+                "text": "This cabinet is not registered yet. A group administrator can use /register_dont_splode first.",
+            }
+        return {"method": "sendMessage", "chat_id": chat_id, "text": await group_leaderboard_message(group), "parse_mode": "HTML"}
     if command.startswith("/register_dont_splode"):
-        chat_id = str(chat.get("id", ""))
-        actor_id = str((message.get("from") or {}).get("id", ""))
         authorized = actor_id in PIT_BOSS_IDS or await telegram_group_admin(chat_id, actor_id)
         if not authorized:
             return {
@@ -1673,7 +1895,10 @@ async def websocket_endpoint(
 ):
     verified_user = verified_telegram_user(tg_init_data)
     verified_start_param = verified_telegram_start_param(tg_init_data)
-    signed_group_ref = clean_group_ref(verified_start_param.removeprefix("join_") if verified_start_param.startswith("join_") else "")
+    signed_join_ref = clean_group_ref(verified_start_param.removeprefix("join_") if verified_start_param.startswith("join_") else "")
+    signed_watch_ref = clean_group_ref(verified_start_param.removeprefix("watch_") if verified_start_param.startswith("watch_") else "")
+    spectator_mode = bool(signed_watch_ref)
+    signed_group_ref = signed_watch_ref or signed_join_ref
     verified_user_id = str(verified_user["id"]) if verified_user else None
     raw_handle = str((verified_user or {}).get("username") or "")
     public_handle = raw_handle if re.fullmatch(r"[A-Za-z0-9_]{5,32}", raw_handle) else ""
@@ -1682,7 +1907,7 @@ async def websocket_endpoint(
         and verified_user_id == user_id
         and verified_user_id in PIT_BOSS_IDS
     )
-    await manager.connect(websocket, user_id, is_pit_boss, signed_group_ref)
+    await manager.connect(websocket, user_id, is_pit_boss, signed_group_ref, spectator_mode)
     await ensure_player_profile(user_id, verified_user, user_name)
     await manager.send_state(user_id, "welcome")
 
@@ -1695,6 +1920,9 @@ async def websocket_endpoint(
             action = data.get("action")
 
             if action == "join":
+                if manager.spectator_contexts.get(user_id):
+                    await reject_action(user_id, "This cabinet launch is watch-only. Enter through a live lobby card to sign the waiver.")
+                    continue
                 if game_state["phase"] != "lobby":
                     await reject_action(user_id, "The lobby is sealed. This fuse already has victims.")
                     continue
@@ -1786,6 +2014,17 @@ async def websocket_endpoint(
                 manager.leaderboard_views[user_id] = requested_view
                 manager.leaderboard_scopes[user_id] = manager.group_contexts.get(user_id, "") if requested_scope == "group" else ""
                 await manager.send_state(user_id, "leaderboard")
+
+            elif action == "season_archive":
+                group_ref = manager.group_contexts.get(user_id, "")
+                if not group_ref:
+                    await reject_action(user_id, "Open the cabinet from a registered group card to inspect that group’s season file.")
+                    continue
+                await manager.send_state(
+                    user_id,
+                    "season_archive",
+                    group_seasons=await group_season_archive_payload(group_ref),
+                )
 
             elif action == "pit_boss_master_reset":
                 if user_id not in manager.pit_boss_connections:
