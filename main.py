@@ -32,6 +32,7 @@ PLAYER_LEDGER_PREFIX = "ds:player_ledger:"
 ADMIN_LEDGER_KEY = "ds:admin_ledger"
 REGISTERED_GROUPS_KEY = "ds:registered_groups"
 ACTIVE_GROUP_CARDS_KEY = "ds:active_group_cards"
+GROUP_COMPETITIVE_PREFIX = "ds:group_competitive:"
 PLAYER_LEDGER_LIMIT = 1000
 ADMIN_LEDGER_LIMIT = 10000
 LEADERBOARD_LIMIT = 10
@@ -55,6 +56,8 @@ PIT_BOSS_DEFAULT_GRANT = 100.0
 PIT_BOSS_MIN_GRANT = 1.0
 PIT_BOSS_MAX_GRANT = 10000.0
 PIT_BOSS_GRANT_COOLDOWN_SECONDS = 1.0
+MASTER_RESET_COOLDOWN_SECONDS = 5.0
+MASTER_RESET_PHRASE = "RESET ALL CHIPS"
 PIT_BOSS_IDS = {
     value.strip()
     for value in os.getenv("PIT_BOSS_USER_IDS", "").split(",")
@@ -92,6 +95,7 @@ game_state = {
 reset_task = None
 intermission_task = None
 lobby_ignition_task = None
+round_group_rosters: dict[str, set[str]] = {}
 
 
 async def get_balance(user_id: str) -> float:
@@ -124,6 +128,12 @@ def clean_profile_name(value: object, fallback: str = "UNKNOWN PLAYER") -> str:
 def clean_public_handle(value: object) -> str:
     handle = str(value or "").strip().lstrip("@")
     return handle if re.fullmatch(r"[A-Za-z0-9_]{5,32}", handle) else ""
+
+
+def clean_group_ref(value: object) -> str:
+    """Accept only the opaque registered-group reference; Telegram chat IDs never enter Mini App state."""
+    candidate = str(value or "").strip()
+    return candidate if re.fullmatch(r"[A-Za-z0-9_-]{8,24}", candidate) else ""
 
 
 def profile_summary(profile: dict) -> dict:
@@ -159,28 +169,82 @@ def public_leaderboard_row(profile: dict, rank: int, view: str) -> dict:
     return row
 
 
-async def public_leaderboard_payload(user_id: str, view: str = "competitive") -> dict:
-    """Build a deterministic public top-ten ranking and an optional private-to-self rank row."""
-    safe_view = "chips" if str(view).lower() == "chips" else "competitive"
-    existing_profiles = await redis_client.hgetall(PLAYER_PROFILES_KEY)
-    for existing_user_id in (await redis_client.hgetall(BALANCES_KEY)).keys():
-        if str(existing_user_id) not in existing_profiles:
-            await ensure_player_profile(str(existing_user_id), fallback_name="LEGACY PLAYER")
-
-    ranked: list[tuple[str, dict]] = []
-    for candidate_id, raw_profile in (await redis_client.hgetall(PLAYER_PROFILES_KEY)).items():
+async def group_is_registered(group_ref: str) -> bool:
+    safe_ref = clean_group_ref(group_ref)
+    if not safe_ref:
+        return False
+    for raw_group in (await redis_client.hgetall(REGISTERED_GROUPS_KEY)).values():
         try:
-            profile = json.loads(raw_profile)
+            if clean_group_ref((json.loads(raw_group) or {}).get("ref")) == safe_ref:
+                return True
         except (TypeError, json.JSONDecodeError):
             continue
-        if not isinstance(profile, dict):
+    return False
+
+
+async def record_group_match_results(group_ref: str, participant_ids: set[str], winner_id: str, payout: float) -> None:
+    """Append only safe, per-group competitive totals for players who entered via that group’s signed lobby card."""
+    safe_ref = clean_group_ref(group_ref)
+    if not participant_ids or not await group_is_registered(safe_ref):
+        return
+    key = f"{GROUP_COMPETITIVE_PREFIX}{safe_ref}"
+    for participant_id in sorted({str(value) for value in participant_ids}):
+        profile = await load_player_profile(participant_id)
+        if profile is None:
+            profile = await ensure_player_profile(participant_id)
+        if profile is None:
             continue
-        profile["balance"] = await get_balance(str(candidate_id))
-        survivals = max(0, int(profile.get("matches_survived", 0) or 0))
-        pot_won = max(0.0, round(float(profile.get("total_pot_won", 0) or 0), 2))
-        if safe_view == "competitive" and survivals <= 0:
-            continue
-        ranked.append((str(candidate_id), profile))
+        try:
+            existing = json.loads(await redis_client.hget(key, participant_id) or "{}")
+        except (TypeError, json.JSONDecodeError):
+            existing = {}
+        existing.update(
+            {
+                "name": clean_profile_name(profile.get("name")),
+                "public_handle": clean_public_handle(profile.get("public_handle")),
+                "matches_entered": int(existing.get("matches_entered", 0) or 0) + 1,
+                "matches_survived": int(existing.get("matches_survived", 0) or 0) + (1 if participant_id == str(winner_id) else 0),
+                "total_pot_won": round(float(existing.get("total_pot_won", 0) or 0) + (float(payout) if participant_id == str(winner_id) else 0.0), 2),
+                "balance": await get_balance(participant_id),
+            }
+        )
+        await redis_client.hset(key, participant_id, json.dumps(existing, separators=(",", ":")))
+
+
+async def public_leaderboard_payload(user_id: str, view: str = "competitive", group_ref: str = "") -> dict:
+    """Build a deterministic global or registered-group ranking without exposing private identifiers."""
+    safe_view = "chips" if str(view).lower() == "chips" else "competitive"
+    safe_group_ref = clean_group_ref(group_ref)
+    group_available = await group_is_registered(safe_group_ref)
+    scope = "group" if group_available else "global"
+    ranked: list[tuple[str, dict]] = []
+    if group_available:
+        for candidate_id, raw_entry in (await redis_client.hgetall(f"{GROUP_COMPETITIVE_PREFIX}{safe_group_ref}")).items():
+            try:
+                profile = json.loads(raw_entry)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(profile, dict) or int(profile.get("matches_entered", 0) or 0) <= 0:
+                continue
+            profile["balance"] = await get_balance(str(candidate_id))
+            ranked.append((str(candidate_id), profile))
+    else:
+        existing_profiles = await redis_client.hgetall(PLAYER_PROFILES_KEY)
+        for existing_user_id in (await redis_client.hgetall(BALANCES_KEY)).keys():
+            if str(existing_user_id) not in existing_profiles:
+                await ensure_player_profile(str(existing_user_id), fallback_name="LEGACY PLAYER")
+        for candidate_id, raw_profile in (await redis_client.hgetall(PLAYER_PROFILES_KEY)).items():
+            try:
+                profile = json.loads(raw_profile)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(profile, dict):
+                continue
+            profile["balance"] = await get_balance(str(candidate_id))
+            survivals = max(0, int(profile.get("matches_survived", 0) or 0))
+            if safe_view == "competitive" and survivals <= 0:
+                continue
+            ranked.append((str(candidate_id), profile))
 
     if safe_view == "chips":
         ranked.sort(
@@ -211,6 +275,8 @@ async def public_leaderboard_payload(user_id: str, view: str = "competitive") ->
             viewer = row
     return {
         "view": safe_view,
+        "scope": scope,
+        "group_available": group_available,
         "entries": entries,
         "viewer": viewer if viewer and viewer["rank"] > LEADERBOARD_LIMIT else None,
         "viewer_rank": viewer["rank"] if viewer else None,
@@ -335,9 +401,9 @@ async def apply_balance_event(
                 profile = await ensure_player_profile(user_id)
                 if profile:
                     profile["balance"] = updated
-                    if amount > 0 and safe_reason.startswith("pit_boss"):
+                    if amount > 0 and safe_reason.startswith("pit_boss") and safe_reason != "pit_boss_master_reset":
                         profile["chips_granted"] = round(float(profile.get("chips_granted", 0)) + amount, 2)
-                    if amount < 0 and safe_reason.startswith("pit_boss"):
+                    if amount < 0 and safe_reason.startswith("pit_boss") and safe_reason != "pit_boss_master_reset":
                         profile["chips_removed"] = round(float(profile.get("chips_removed", 0)) + abs(amount), 2)
                     await save_player_profile(user_id, profile)
                 return updated
@@ -367,6 +433,31 @@ async def change_balance(
         round_ref=round_ref,
         metadata=metadata,
     )
+
+
+async def master_reset_virtual_chips(actor_id: str, reason: str) -> int:
+    """Restore every known virtual-chip balance to the default through individual append-only ledger events."""
+    safe_reason = clean_profile_name(reason, "")[:96]
+    if len(safe_reason.strip()) < 3:
+        raise ValueError("A master reset requires a short audit reason.")
+    existing_profiles = await redis_client.hgetall(PLAYER_PROFILES_KEY)
+    balance_ids = {str(user_id) for user_id in (await redis_client.hgetall(BALANCES_KEY)).keys()}
+    target_ids = {str(user_id) for user_id in existing_profiles.keys()} | balance_ids
+    changed = 0
+    for target_id in sorted(target_ids):
+        current = await get_balance(target_id)
+        adjustment = round(DEFAULT_BALANCE - current, 2)
+        if adjustment == 0:
+            continue
+        await apply_balance_event(
+            target_id,
+            adjustment,
+            "pit_boss_master_reset",
+            actor_id=actor_id,
+            metadata={"note": safe_reason, "reset_to": DEFAULT_BALANCE},
+        )
+        changed += 1
+    return changed
 
 
 async def claim_action_slot(user_id: str, action: str, cooldown_seconds: float) -> bool:
@@ -512,8 +603,8 @@ async def touch_registered_group(group_ref: str, field: str) -> None:
         return
 
 
-def verified_telegram_user(init_data: str) -> dict | None:
-    """Return verified Telegram user data without ever trusting the URL path identity."""
+def verified_telegram_context(init_data: str) -> tuple[dict, str] | None:
+    """Return verified Telegram user data and its signed Mini App start parameter."""
     if not TELEGRAM_BOT_TOKEN or not init_data:
         return None
     try:
@@ -528,9 +619,23 @@ def verified_telegram_user(init_data: str) -> dict | None:
         if not hmac.compare_digest(calculated_hash, supplied_hash):
             return None
         user = json.loads(fields["user"])
-        return user if isinstance(user, dict) and user.get("id") is not None else None
+        if not isinstance(user, dict) or user.get("id") is None:
+            return None
+        return user, str(fields.get("start_param", ""))
     except (KeyError, ValueError, TypeError, json.JSONDecodeError):
         return None
+
+
+def verified_telegram_user(init_data: str) -> dict | None:
+    """Return verified Telegram user data without ever trusting the URL path identity."""
+    context = verified_telegram_context(init_data)
+    return context[0] if context else None
+
+
+def verified_telegram_start_param(init_data: str) -> str:
+    """Return a verified launch parameter, never an untrusted browser query value."""
+    context = verified_telegram_context(init_data)
+    return context[1] if context else ""
 
 
 def verified_telegram_user_id(init_data: str) -> str | None:
@@ -751,12 +856,16 @@ class ConnectionManager:
         self.active_connections: dict[str, WebSocket] = {}
         self.pit_boss_connections: set[str] = set()
         self.leaderboard_views: dict[str, str] = {}
+        self.leaderboard_scopes: dict[str, str] = {}
+        self.group_contexts: dict[str, str] = {}
 
-    async def connect(self, websocket: WebSocket, user_id: str, is_pit_boss: bool = False):
+    async def connect(self, websocket: WebSocket, user_id: str, is_pit_boss: bool = False, group_ref: str = ""):
         await websocket.accept()
         previous_connection = self.active_connections.get(user_id)
         self.active_connections[user_id] = websocket
         self.leaderboard_views.setdefault(user_id, "competitive")
+        self.group_contexts[user_id] = clean_group_ref(group_ref)
+        self.leaderboard_scopes[user_id] = self.group_contexts[user_id]
         if is_pit_boss:
             self.pit_boss_connections.add(user_id)
         else:
@@ -772,6 +881,8 @@ class ConnectionManager:
             del self.active_connections[user_id]
             self.pit_boss_connections.discard(user_id)
             self.leaderboard_views.pop(user_id, None)
+            self.leaderboard_scopes.pop(user_id, None)
+            self.group_contexts.pop(user_id, None)
 
     async def send_state(self, user_id: str, event_type: str, **extra):
         connection = self.active_connections.get(user_id)
@@ -787,7 +898,9 @@ class ConnectionManager:
                     "leaderboard": await public_leaderboard_payload(
                         user_id,
                         self.leaderboard_views.get(user_id, "competitive"),
+                        self.leaderboard_scopes.get(user_id, ""),
                     ),
+                    "group_context_available": bool(self.group_contexts.get(user_id)),
                     "pit_boss": user_id in self.pit_boss_connections,
                     "pit_boss_grant": (
                         {
@@ -834,7 +947,7 @@ def generate_crash():
     return seed, hashed, round(crash, 2)
 
 
-def current_lobby_card() -> dict:
+def current_lobby_card(group_ref: str = "") -> dict:
     """Build the public, visual announcement Telegram inserts into a selected chat."""
     players = game_state["players"]
     ready_players = {str(user_id) for user_id in game_state.get("ready_players", [])}
@@ -866,10 +979,12 @@ def current_lobby_card() -> dict:
         if phase == "intermission"
         else "<i>The fuse is lit. Keep your hands where we can see them.</i>"
     )
+    safe_group_ref = clean_group_ref(group_ref)
+    start_param = f"join_{safe_group_ref}" if safe_group_ref else "join"
     button = (
         {
             "text": "JOIN THE LOBBY — 100 ◉",
-            "url": f"https://t.me/{BOT_USERNAME}?startapp=join",
+            "url": f"https://t.me/{BOT_USERNAME}?startapp={start_param}",
         }
         if phase == "lobby"
         else {
@@ -1104,7 +1219,7 @@ async def send_registered_group_lobby_card(group: dict) -> bool:
     chat_id = str(group.get("chat_id", ""))
     if not chat_id:
         return False
-    card = current_lobby_card()
+    card = current_lobby_card(clean_group_ref(group.get("ref")))
     ok, result = await telegram_api_call(
         "sendPhoto",
         {
@@ -1151,7 +1266,15 @@ async def refresh_lobby_cards() -> None:
         await redis_client.srem(ACTIVE_LOBBY_CARDS_KEY, *stale_ids)
     group_cards = await active_group_cards()
     group_outcomes = await asyncio.gather(
-        *(edit_group_caption(record["chat_id"], record["message_id"], text, markup) for _, record in group_cards)
+        *(
+            edit_group_caption(
+                record["chat_id"],
+                record["message_id"],
+                current_lobby_card(record.get("group_ref", ""))["caption"],
+                current_lobby_card(record.get("group_ref", ""))["reply_markup"],
+            )
+            for _, record in group_cards
+        )
     ) if group_cards else []
     stale_group_keys = [card_key for (card_key, _), ok in zip(group_cards, group_outcomes) if not ok]
     if stale_group_keys:
@@ -1332,6 +1455,7 @@ async def telegram_webhook(
 
 def reset_round_state():
     """Clear only transient game state while preserving Redis-backed balances."""
+    round_group_rosters.clear()
     game_state.update(
         {
             "phase": "lobby",
@@ -1506,6 +1630,8 @@ async def detonate():
 
     if is_final:
         # Retain only public-safe match statistics after the lobby reopens.
+        for group_ref, participant_ids in list(round_group_rosters.items()):
+            await record_group_match_results(group_ref, participant_ids, survivors[0]["id"] if survivors else "", payout)
         game_state["phase"] = "ended"
         game_state["latest_round"] = {
             "multiplier": round(game_state["multiplier"], 2),
@@ -1546,6 +1672,8 @@ async def websocket_endpoint(
     tg_init_data: str = "",
 ):
     verified_user = verified_telegram_user(tg_init_data)
+    verified_start_param = verified_telegram_start_param(tg_init_data)
+    signed_group_ref = clean_group_ref(verified_start_param.removeprefix("join_") if verified_start_param.startswith("join_") else "")
     verified_user_id = str(verified_user["id"]) if verified_user else None
     raw_handle = str((verified_user or {}).get("username") or "")
     public_handle = raw_handle if re.fullmatch(r"[A-Za-z0-9_]{5,32}", raw_handle) else ""
@@ -1554,7 +1682,7 @@ async def websocket_endpoint(
         and verified_user_id == user_id
         and verified_user_id in PIT_BOSS_IDS
     )
-    await manager.connect(websocket, user_id, is_pit_boss)
+    await manager.connect(websocket, user_id, is_pit_boss, signed_group_ref)
     await ensure_player_profile(user_id, verified_user, user_name)
     await manager.send_state(user_id, "welcome")
 
@@ -1593,6 +1721,8 @@ async def websocket_endpoint(
                 await update_player_profile(user_id, matches_entered=1)
                 game_state["pot"] += JOIN_COST
                 game_state["players"].append({"id": user_id, "name": user_name, "public_handle": public_handle})
+                if signed_group_ref:
+                    round_group_rosters.setdefault(signed_group_ref, set()).add(user_id)
                 if (
                     len(game_state["players"]) >= MINIMUM_COUNTDOWN_PLAYERS
                     and not game_state.get("lobby_auto_start_at")
@@ -1652,8 +1782,38 @@ async def websocket_endpoint(
 
             elif action == "leaderboard":
                 requested_view = "chips" if str(data.get("view", "")).lower() == "chips" else "competitive"
+                requested_scope = str(data.get("scope", "")).lower()
                 manager.leaderboard_views[user_id] = requested_view
+                manager.leaderboard_scopes[user_id] = manager.group_contexts.get(user_id, "") if requested_scope == "group" else ""
                 await manager.send_state(user_id, "leaderboard")
+
+            elif action == "pit_boss_master_reset":
+                if user_id not in manager.pit_boss_connections:
+                    await reject_action(user_id, "Only a verified Pit Boss may reset the virtual chip cabinet.")
+                    continue
+                if game_state["phase"] != "lobby" or game_state["players"]:
+                    await reject_action(user_id, "Master reset is locked until the lobby is empty and no fuse is active.")
+                    continue
+                confirmation = str(data.get("confirmation", "")).strip().upper()
+                note = clean_profile_name(data.get("reason", ""), "")[:96]
+                if confirmation != MASTER_RESET_PHRASE:
+                    await reject_action(user_id, f"Type {MASTER_RESET_PHRASE} exactly before resetting every virtual stack.")
+                    continue
+                if len(note.strip()) < 3:
+                    await reject_action(user_id, "Write a short reset reason for the cabinet audit file.")
+                    continue
+                if not await claim_action_slot(user_id, "pit_boss_master_reset", MASTER_RESET_COOLDOWN_SECONDS):
+                    await reject_action(user_id, "The master reset lever is cooling down. One moment.")
+                    continue
+                changed_count = await master_reset_virtual_chips(user_id, note)
+                dashboard = await pit_boss_dashboard_payload()
+                await manager.send_state(
+                    user_id,
+                    "pit_boss_master_reset",
+                    reset_count=changed_count,
+                    pit_boss_dashboard=dashboard,
+                )
+                await manager.broadcast_leaderboard()
 
             elif action == "pit_boss_grant":
                 if user_id not in manager.pit_boss_connections:

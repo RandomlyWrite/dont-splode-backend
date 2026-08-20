@@ -542,6 +542,13 @@ async def run_checks() -> None:
         refreshed_dashboard = await main.pit_boss_dashboard_payload()
         assert refreshed_dashboard["groups"][0]["games_started"] == 1
         assert "-100123" not in str(refreshed_dashboard)
+        await main.record_group_match_results(group["ref"], {"leader-alpha", "leader-beta", "leader-gamma"}, "leader-beta", 650)
+        group_board = await main.public_leaderboard_payload("leader-alpha", "competitive", group["ref"])
+        assert group_board["scope"] == "group" and group_board["group_available"] is True
+        assert group_board["entries"][0]["name"] == "Beta" and group_board["entries"][0]["survivals"] == 1
+        assert group_board["entries"][0]["pot_won"] == 650.0
+        assert len(group_board["entries"]) == 3 and "leader-alpha" not in str(group_board)
+        assert (await main.public_leaderboard_payload("leader-alpha", "competitive", "bad-group-ref"))["scope"] == "global"
         native_card_calls: list[tuple[str, dict]] = []
 
         async def capture_native_card(method: str, payload: dict):
@@ -553,10 +560,21 @@ async def run_checks() -> None:
         stored_cards = await main.active_group_cards()
         assert stored_cards[0][1]["group_ref"] == group["ref"]
         assert native_card_calls[0][0] == "sendPhoto"
+        group_launch_url = native_card_calls[0][1]["reply_markup"]["inline_keyboard"][0][0]["url"]
+        assert f"startapp=join_{group['ref']}" in group_launch_url and "-100123" not in group_launch_url
         assert await main.edit_group_media("-100123", 77, "elimination-qa", "Public result", {"inline_keyboard": []})
         assert native_card_calls[-1][0] == "editMessageMedia"
         assert native_card_calls[-1][1]["media"]["media"].endswith("/elimination-qa.png")
         assert "-100123" not in str(refreshed_dashboard)
+        alpha_before_reset = await main.load_player_profile("leader-alpha")
+        assert alpha_before_reset and alpha_before_reset["matches_survived"] == 3
+        reset_count = await main.master_reset_virtual_chips("pit-boss", "QA cabinet reset")
+        assert reset_count > 0
+        assert await main.get_balance("leader-alpha") == main.DEFAULT_BALANCE
+        alpha_after_reset = await main.load_player_profile("leader-alpha")
+        assert alpha_after_reset and alpha_after_reset["matches_survived"] == 3 and alpha_after_reset["total_pot_won"] == 275.0
+        reset_events = await ledger_redis.lrange(f"{main.PLAYER_LEDGER_PREFIX}leader-alpha", 0, -1)
+        assert any("pit_boss_master_reset" in event and "QA cabinet reset" in event for event in reset_events)
         print("Ledger guard: profiles, signed events, non-negative debits, and public-safe group registry all hold.")
     finally:
         main.redis_client = original_redis
