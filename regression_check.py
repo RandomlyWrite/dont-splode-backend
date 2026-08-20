@@ -118,12 +118,16 @@ async def run_checks() -> None:
         def __init__(self):
             self.accepted = False
             self.closed: tuple[int, str] | None = None
+            self.sent: list[dict] = []
 
         async def accept(self):
             self.accepted = True
 
         async def close(self, code: int = 1000, reason: str = ""):
             self.closed = (code, reason)
+
+        async def send_json(self, payload: dict):
+            self.sent.append(payload)
 
     session_manager = main.ConnectionManager()
     first_session = FakeSocket()
@@ -594,9 +598,16 @@ async def run_checks() -> None:
             main.PIT_BOSS_IDS.clear()
             main.PIT_BOSS_IDS.update(original_pit_boss_ids)
         spectator_socket = FakeSocket()
+        reaction_peer = FakeSocket()
         spectator_manager = main.ConnectionManager()
         await spectator_manager.connect(spectator_socket, "spectator-user", group_ref=group["ref"], spectator=True)
+        await spectator_manager.connect(reaction_peer, "reaction-peer")
         assert spectator_manager.spectator_contexts["spectator-user"] is True and spectator_manager.group_contexts["spectator-user"] == group["ref"]
+        await spectator_manager.broadcast_spectator_reaction("🔥")
+        assert spectator_socket.sent[-1] == {"type": "spectator_reaction", "reaction": "🔥"}
+        assert reaction_peer.sent[-1] == {"type": "spectator_reaction", "reaction": "🔥"}
+        assert "spectator-user" not in str(spectator_socket.sent[-1]) and "reaction-peer" not in str(reaction_peer.sent[-1])
+        assert "🔥" in main.SPECTATOR_REACTIONS and "not-a-reaction" not in main.SPECTATOR_REACTIONS
         spectator_manager.disconnect("spectator-user", spectator_socket)
         assert "spectator-user" not in spectator_manager.spectator_contexts
         native_card_calls: list[tuple[str, dict]] = []

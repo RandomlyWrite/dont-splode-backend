@@ -62,6 +62,8 @@ PIT_BOSS_MAX_GRANT = 10000.0
 PIT_BOSS_GRANT_COOLDOWN_SECONDS = 1.0
 MASTER_RESET_COOLDOWN_SECONDS = 5.0
 MASTER_RESET_PHRASE = "RESET ALL CHIPS"
+SPECTATOR_REACTIONS = {"👀", "🔥", "😱", "💥", "🪦"}
+SPECTATOR_REACTION_COOLDOWN_SECONDS = 1.8
 PIT_BOSS_IDS = {
     value.strip()
     for value in os.getenv("PIT_BOSS_USER_IDS", "").split(",")
@@ -1127,6 +1129,15 @@ class ConnectionManager:
         for user_id in list(self.active_connections):
             await self.send_state(user_id, "leaderboard_refresh")
 
+    async def broadcast_spectator_reaction(self, reaction: str) -> None:
+        """Deliver one anonymous, non-gameplay spectator reaction without sending profile data."""
+        payload = {"type": "spectator_reaction", "reaction": reaction}
+        for connection in list(self.active_connections.values()):
+            try:
+                await connection.send_json(payload)
+            except Exception:
+                pass
+
 
 manager = ConnectionManager()
 
@@ -2025,6 +2036,22 @@ async def websocket_endpoint(
                     "season_archive",
                     group_seasons=await group_season_archive_payload(group_ref),
                 )
+
+            elif action == "spectator_reaction":
+                if not manager.spectator_contexts.get(user_id):
+                    await reject_action(user_id, "Only watch-only cabinet visitors may trigger the reaction rail.")
+                    continue
+                if game_state["phase"] not in {"running", "intermission"}:
+                    await reject_action(user_id, "The reaction rail wakes only while the fuse is live or the ash is settling.")
+                    continue
+                reaction = str(data.get("reaction", ""))
+                if reaction not in SPECTATOR_REACTIONS:
+                    await reject_action(user_id, "That reaction is not mounted on this cabinet.")
+                    continue
+                if not await claim_action_slot(user_id, "spectator_reaction", SPECTATOR_REACTION_COOLDOWN_SECONDS):
+                    await reject_action(user_id, "The reaction rail needs a moment before another outburst.")
+                    continue
+                await manager.broadcast_spectator_reaction(reaction)
 
             elif action == "pit_boss_master_reset":
                 if user_id not in manager.pit_boss_connections:
