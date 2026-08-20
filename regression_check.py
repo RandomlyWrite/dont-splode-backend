@@ -491,6 +491,17 @@ async def run_checks() -> None:
         dashboard = await main.pit_boss_dashboard_payload(profile["ref"])
         assert dashboard["profiles"][0]["public_handle"] == "ledgerplayer"
         assert "verified-ledger-user" not in str(dashboard)
+        second_player = await main.ensure_player_profile(
+            "verified-ledger-search-user",
+            {"first_name": "Balance Baron", "username": "chipbaron"},
+        )
+        assert await main.apply_balance_event("verified-ledger-search-user", 175, "pit_boss_credit", actor_id="pit-boss") == 675.0
+        handle_search = await main.pit_boss_dashboard_payload(search="@chipbaron", sort="balance_desc")
+        assert len(handle_search["profiles"]) == 1 and handle_search["profiles"][0]["name"] == "Balance Baron"
+        high_balance = await main.pit_boss_dashboard_payload(sort="balance_desc")
+        low_balance = await main.pit_boss_dashboard_payload(sort="balance_asc")
+        assert high_balance["profiles"][0]["ref"] == second_player["ref"]
+        assert low_balance["profiles"][0]["ref"] == profile["ref"]
         group = await main.register_telegram_group({"id": -100123, "type": "supergroup", "title": "Cabinet QA"})
         assert group and group["title"] == "Cabinet QA"
         await main.touch_registered_group(group["ref"], "games_started")

@@ -312,14 +312,17 @@ async def daily_claim_status(user_id: str) -> dict:
     return {"available": False, "seconds_until": int(ttl), "amount": DAILY_CHIP_GRANT}
 
 
-async def pit_boss_dashboard_payload(profile_ref: str = "", search: str = "") -> dict:
+async def pit_boss_dashboard_payload(profile_ref: str = "", search: str = "", sort: str = "balance_desc") -> dict:
     """Return bounded, reference-based administration data without exposing raw Telegram IDs to the client."""
     existing_profiles = await redis_client.hgetall(PLAYER_PROFILES_KEY)
     for existing_user_id in (await redis_client.hgetall(BALANCES_KEY)).keys():
         if str(existing_user_id) not in existing_profiles:
             await ensure_player_profile(str(existing_user_id), fallback_name="LEGACY PLAYER")
     raw_profiles = await redis_client.hgetall(PLAYER_PROFILES_KEY)
-    needle = str(search or "").strip().lower()[:48]
+    needle = str(search or "").strip().lower().lstrip("@")[:48]
+    sort_mode = str(sort or "balance_desc").strip().lower()
+    if sort_mode not in {"balance_desc", "balance_asc", "recent", "matches_desc", "name_asc"}:
+        sort_mode = "balance_desc"
     profiles: list[dict] = []
     selected_id = ""
     for user_id, raw_profile in raw_profiles.items():
@@ -334,7 +337,16 @@ async def pit_boss_dashboard_payload(profile_ref: str = "", search: str = "") ->
         profiles.append(summary)
         if summary["ref"] == profile_ref:
             selected_id = str(user_id)
-    profiles.sort(key=lambda item: (item["last_seen"], item["name"].lower()), reverse=True)
+    if sort_mode == "balance_asc":
+        profiles.sort(key=lambda item: (item["balance"], item["name"].lower()))
+    elif sort_mode == "recent":
+        profiles.sort(key=lambda item: (item["last_seen"], item["name"].lower()), reverse=True)
+    elif sort_mode == "matches_desc":
+        profiles.sort(key=lambda item: (item["matches_entered"], item["balance"], item["name"].lower()), reverse=True)
+    elif sort_mode == "name_asc":
+        profiles.sort(key=lambda item: (item["name"].lower(), -item["balance"]))
+    else:
+        profiles.sort(key=lambda item: (item["balance"], item["name"].lower()), reverse=True)
     profiles = profiles[:100]
 
     ledger: list[dict] = []
@@ -375,7 +387,7 @@ async def pit_boss_dashboard_payload(profile_ref: str = "", search: str = "") ->
             }
         )
     groups.sort(key=lambda item: (item["last_played"], item["title"].lower()), reverse=True)
-    return {"profiles": profiles, "ledger": ledger, "groups": groups[:100], "selected_ref": profile_ref}
+    return {"profiles": profiles, "ledger": ledger, "groups": groups[:100], "selected_ref": profile_ref, "sort": sort_mode}
 
 
 async def register_telegram_group(chat: dict) -> dict | None:
@@ -1606,7 +1618,8 @@ async def websocket_endpoint(
                     continue
                 profile_ref = str(data.get("profile_ref", ""))[:32]
                 search = clean_profile_name(data.get("search", ""), "")[:48]
-                dashboard = await pit_boss_dashboard_payload(profile_ref, search)
+                sort = str(data.get("sort", "balance_desc"))[:24]
+                dashboard = await pit_boss_dashboard_payload(profile_ref, search, sort)
                 await manager.send_state(user_id, "pit_boss_dashboard", pit_boss_dashboard=dashboard)
 
             elif action == "pit_boss_adjust":
