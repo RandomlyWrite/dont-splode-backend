@@ -34,6 +34,7 @@ REGISTERED_GROUPS_KEY = "ds:registered_groups"
 ACTIVE_GROUP_CARDS_KEY = "ds:active_group_cards"
 PLAYER_LEDGER_LIMIT = 1000
 ADMIN_LEDGER_LIMIT = 10000
+LEADERBOARD_LIMIT = 10
 
 HOUSE_EDGE = 0.03
 PASS_FEE = 5.0
@@ -136,10 +137,85 @@ def profile_summary(profile: dict) -> dict:
         "last_seen": int(profile.get("last_seen", 0) or 0),
         "matches_entered": int(profile.get("matches_entered", 0) or 0),
         "matches_survived": int(profile.get("matches_survived", 0) or 0),
+        "total_pot_won": round(float(profile.get("total_pot_won", 0) or 0), 2),
         "eliminations": int(profile.get("eliminations", 0) or 0),
         "passes": int(profile.get("passes", 0) or 0),
         "chips_granted": round(float(profile.get("chips_granted", 0) or 0), 2),
         "chips_removed": round(float(profile.get("chips_removed", 0) or 0), 2),
+    }
+
+
+def public_leaderboard_row(profile: dict, rank: int, view: str) -> dict:
+    """Return one public-safe leaderboard row without profile references or Telegram IDs."""
+    row = {
+        "rank": int(rank),
+        "name": clean_profile_name(profile.get("name")),
+        "public_handle": clean_public_handle(profile.get("public_handle")),
+        "survivals": max(0, int(profile.get("matches_survived", 0) or 0)),
+        "pot_won": max(0.0, round(float(profile.get("total_pot_won", 0) or 0), 2)),
+    }
+    if view == "chips":
+        row["balance"] = max(0.0, round(float(profile.get("balance", 0) or 0), 2))
+    return row
+
+
+async def public_leaderboard_payload(user_id: str, view: str = "competitive") -> dict:
+    """Build a deterministic public top-ten ranking and an optional private-to-self rank row."""
+    safe_view = "chips" if str(view).lower() == "chips" else "competitive"
+    existing_profiles = await redis_client.hgetall(PLAYER_PROFILES_KEY)
+    for existing_user_id in (await redis_client.hgetall(BALANCES_KEY)).keys():
+        if str(existing_user_id) not in existing_profiles:
+            await ensure_player_profile(str(existing_user_id), fallback_name="LEGACY PLAYER")
+
+    ranked: list[tuple[str, dict]] = []
+    for candidate_id, raw_profile in (await redis_client.hgetall(PLAYER_PROFILES_KEY)).items():
+        try:
+            profile = json.loads(raw_profile)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(profile, dict):
+            continue
+        profile["balance"] = await get_balance(str(candidate_id))
+        survivals = max(0, int(profile.get("matches_survived", 0) or 0))
+        pot_won = max(0.0, round(float(profile.get("total_pot_won", 0) or 0), 2))
+        if safe_view == "competitive" and survivals <= 0:
+            continue
+        ranked.append((str(candidate_id), profile))
+
+    if safe_view == "chips":
+        ranked.sort(
+            key=lambda item: (
+                -max(0.0, round(float(item[1].get("balance", 0) or 0), 2)),
+                -max(0, int(item[1].get("matches_entered", 0) or 0)),
+                clean_profile_name(item[1].get("name")).lower(),
+                str(item[1].get("ref", "")),
+            )
+        )
+    else:
+        ranked.sort(
+            key=lambda item: (
+                -max(0, int(item[1].get("matches_survived", 0) or 0)),
+                -max(0.0, round(float(item[1].get("total_pot_won", 0) or 0), 2)),
+                clean_profile_name(item[1].get("name")).lower(),
+                str(item[1].get("ref", "")),
+            )
+        )
+
+    entries: list[dict] = []
+    viewer = None
+    for rank, (candidate_id, profile) in enumerate(ranked, start=1):
+        row = public_leaderboard_row(profile, rank, safe_view)
+        if rank <= LEADERBOARD_LIMIT:
+            entries.append(row)
+        if candidate_id == str(user_id):
+            viewer = row
+    return {
+        "view": safe_view,
+        "entries": entries,
+        "viewer": viewer if viewer and viewer["rank"] > LEADERBOARD_LIMIT else None,
+        "viewer_rank": viewer["rank"] if viewer else None,
+        "eligible_count": len(ranked),
+        "updated_at": int(time.time()),
     }
 
 
@@ -176,6 +252,7 @@ async def ensure_player_profile(
             "last_seen": now,
             "matches_entered": 0,
             "matches_survived": 0,
+            "total_pot_won": 0.0,
             "eliminations": 0,
             "passes": 0,
             "chips_granted": 0.0,
@@ -203,7 +280,7 @@ async def update_player_profile(user_id: str, **increments: float) -> dict | Non
     profile["last_seen"] = int(time.time())
     profile["balance"] = await get_balance(user_id)
     for key, value in increments.items():
-        if key not in {"matches_entered", "matches_survived", "eliminations", "passes", "chips_granted", "chips_removed"}:
+        if key not in {"matches_entered", "matches_survived", "total_pot_won", "eliminations", "passes", "chips_granted", "chips_removed"}:
             continue
         profile[key] = round(float(profile.get(key, 0) or 0) + float(value), 2)
     await save_player_profile(user_id, profile)
@@ -673,11 +750,13 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: dict[str, WebSocket] = {}
         self.pit_boss_connections: set[str] = set()
+        self.leaderboard_views: dict[str, str] = {}
 
     async def connect(self, websocket: WebSocket, user_id: str, is_pit_boss: bool = False):
         await websocket.accept()
         previous_connection = self.active_connections.get(user_id)
         self.active_connections[user_id] = websocket
+        self.leaderboard_views.setdefault(user_id, "competitive")
         if is_pit_boss:
             self.pit_boss_connections.add(user_id)
         else:
@@ -692,6 +771,7 @@ class ConnectionManager:
         if websocket is None or self.active_connections.get(user_id) is websocket:
             del self.active_connections[user_id]
             self.pit_boss_connections.discard(user_id)
+            self.leaderboard_views.pop(user_id, None)
 
     async def send_state(self, user_id: str, event_type: str, **extra):
         connection = self.active_connections.get(user_id)
@@ -704,6 +784,10 @@ class ConnectionManager:
                     "state": game_state,
                     "balance": await get_balance(user_id),
                     "daily_claim": await daily_claim_status(user_id),
+                    "leaderboard": await public_leaderboard_payload(
+                        user_id,
+                        self.leaderboard_views.get(user_id, "competitive"),
+                    ),
                     "pit_boss": user_id in self.pit_boss_connections,
                     "pit_boss_grant": (
                         {
@@ -723,6 +807,10 @@ class ConnectionManager:
     async def broadcast_state(self, event_type: str, **extra):
         for user_id in list(self.active_connections):
             await self.send_state(user_id, event_type, **extra)
+
+    async def broadcast_leaderboard(self) -> None:
+        for user_id in list(self.active_connections):
+            await self.send_state(user_id, "leaderboard_refresh")
 
 
 manager = ConnectionManager()
@@ -1412,7 +1500,7 @@ async def detonate():
             "final_survivor_payout",
             round_ref=game_state["round_number"],
         )
-        await update_player_profile(survivors[0]["id"], matches_survived=1)
+        await update_player_profile(survivors[0]["id"], matches_survived=1, total_pot_won=payout)
     if loser:
         await update_player_profile(loser["id"], eliminations=1)
 
@@ -1560,6 +1648,12 @@ async def websocket_endpoint(
                     "daily_claimed",
                     claim_amount=DAILY_CHIP_GRANT,
                 )
+                await manager.broadcast_leaderboard()
+
+            elif action == "leaderboard":
+                requested_view = "chips" if str(data.get("view", "")).lower() == "chips" else "competitive"
+                manager.leaderboard_views[user_id] = requested_view
+                await manager.send_state(user_id, "leaderboard")
 
             elif action == "pit_boss_grant":
                 if user_id not in manager.pit_boss_connections:
@@ -1611,6 +1705,7 @@ async def websocket_endpoint(
                         "pit_boss_grant_sent",
                         grant_amount=grant_amount,
                     )
+                await manager.broadcast_leaderboard()
 
             elif action == "pit_boss_dashboard":
                 if user_id not in manager.pit_boss_connections:
@@ -1683,6 +1778,7 @@ async def websocket_endpoint(
                     adjustment_balance=updated_balance,
                     pit_boss_dashboard=dashboard,
                 )
+                await manager.broadcast_leaderboard()
 
             elif action == "force_start":
                 await reject_action(

@@ -97,7 +97,7 @@ async def run_checks() -> None:
     assert [player["id"] for player in main.game_state["eliminated_players"]] == ["one", "two", "three"]
     assert balance_changes == [("four", 415.0)]
     assert ("one", {"eliminations": 1}) in profile_updates
-    assert ("four", {"matches_survived": 1}) in profile_updates
+    assert ("four", {"matches_survived": 1, "total_pot_won": 415.0}) in profile_updates
     assert broadcasts[-1][0] == "sploded"
     assert broadcasts[-1][1]["final"] is True
     assert scheduled == ["next", "next", "reset"]
@@ -502,6 +502,40 @@ async def run_checks() -> None:
         low_balance = await main.pit_boss_dashboard_payload(sort="balance_asc")
         assert high_balance["profiles"][0]["ref"] == second_player["ref"]
         assert low_balance["profiles"][0]["ref"] == profile["ref"]
+        leader_alpha = await main.ensure_player_profile("leader-alpha", {"first_name": "Alpha", "username": "alpha_soul"})
+        leader_beta = await main.ensure_player_profile("leader-beta", {"first_name": "Beta", "username": "beta_soul"})
+        leader_gamma = await main.ensure_player_profile("leader-gamma", {"first_name": "Gamma", "username": "gamma_soul"})
+        await main.update_player_profile("leader-alpha", matches_survived=3, total_pot_won=275)
+        await main.update_player_profile("leader-beta", matches_survived=3, total_pot_won=490)
+        await main.update_player_profile("leader-gamma", matches_survived=2, total_pot_won=900)
+        competitive = await main.public_leaderboard_payload("leader-alpha", "competitive")
+        assert competitive["view"] == "competitive"
+        assert competitive["entries"][0]["name"] == "Beta"
+        assert competitive["entries"][1]["name"] == "Alpha"
+        assert competitive["entries"][2]["name"] == "Gamma"
+        assert competitive["entries"][0]["survivals"] == 3 and competitive["entries"][0]["pot_won"] == 490.0
+        assert all("ref" not in row and "target_id" not in row and "chips_granted" not in row for row in competitive["entries"])
+        assert "leader-alpha" not in str(competitive) and "leader-beta" not in str(competitive)
+        await main.apply_balance_event("leader-alpha", 900, "pit_boss_credit", actor_id="pit-boss")
+        chip_stack = await main.public_leaderboard_payload("leader-alpha", "chips")
+        assert chip_stack["view"] == "chips" and chip_stack["entries"][0]["name"] == "Alpha"
+        assert chip_stack["entries"][0]["balance"] == 1400.0
+        assert competitive["entries"][1]["rank"] == 2
+        ledger_redis.hashes.setdefault(main.BALANCES_KEY, {})["legacy-balance-user"] = "333"
+        legacy_stack = await main.public_leaderboard_payload("legacy-balance-user", "chips")
+        assert legacy_stack["eligible_count"] >= chip_stack["eligible_count"] + 1
+        assert "legacy-balance-user" not in str(legacy_stack)
+        for index in range(12):
+            candidate_id = f"rank-fixture-{index}"
+            await main.ensure_player_profile(candidate_id, {"first_name": f"Rank {index}", "username": f"rank_soul_{index}"})
+            await main.update_player_profile(candidate_id, matches_survived=20 - index, total_pot_won=100 + index)
+        outsider = await main.ensure_player_profile("rank-outsider", {"first_name": "Outside Ten", "username": "outside_ten"})
+        await main.update_player_profile("rank-outsider", matches_survived=1, total_pot_won=1)
+        outside_board = await main.public_leaderboard_payload("rank-outsider", "competitive")
+        assert len(outside_board["entries"]) == main.LEADERBOARD_LIMIT
+        assert outside_board["viewer"] and outside_board["viewer"]["name"] == "Outside Ten"
+        assert outside_board["viewer_rank"] == outside_board["viewer"]["rank"] > main.LEADERBOARD_LIMIT
+        assert outsider["ref"] not in str(outside_board)
         group = await main.register_telegram_group({"id": -100123, "type": "supergroup", "title": "Cabinet QA"})
         assert group and group["title"] == "Cabinet QA"
         await main.touch_registered_group(group["ref"], "games_started")
