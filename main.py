@@ -21,9 +21,19 @@ import redis.asyncio as aioredis
 
 app = FastAPI()
 
-# Redis is the authoritative balance ledger; the browser never supplies a chip balance.
+# Redis is the authoritative virtual-chip ledger; the browser never supplies a chip balance.
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+
+BALANCES_KEY = "ds:balances"
+PLAYER_PROFILES_KEY = "ds:player_profiles"
+PLAYER_PROFILE_REFS_KEY = "ds:player_profile_refs"
+PLAYER_LEDGER_PREFIX = "ds:player_ledger:"
+ADMIN_LEDGER_KEY = "ds:admin_ledger"
+REGISTERED_GROUPS_KEY = "ds:registered_groups"
+ACTIVE_GROUP_CARDS_KEY = "ds:active_group_cards"
+PLAYER_LEDGER_LIMIT = 1000
+ADMIN_LEDGER_LIMIT = 10000
 
 HOUSE_EDGE = 0.03
 PASS_FEE = 5.0
@@ -85,9 +95,9 @@ lobby_ignition_task = None
 
 async def get_balance(user_id: str) -> float:
     """Return a validated, persistent server-side balance for one player."""
-    raw_balance = await redis_client.hget("ds:balances", user_id)
+    raw_balance = await redis_client.hget(BALANCES_KEY, user_id)
     if raw_balance is None:
-        await redis_client.hset("ds:balances", user_id, DEFAULT_BALANCE)
+        await redis_client.hset(BALANCES_KEY, user_id, DEFAULT_BALANCE)
         return DEFAULT_BALANCE
 
     try:
@@ -99,15 +109,187 @@ async def get_balance(user_id: str) -> float:
     # path, so repair them rather than leaving a new player permanently locked out.
     if not math.isfinite(balance) or balance < 0:
         balance = DEFAULT_BALANCE
-        await redis_client.hset("ds:balances", user_id, balance)
+        await redis_client.hset(BALANCES_KEY, user_id, balance)
 
     return round(balance, 2)
 
 
-async def change_balance(user_id: str, amount: float) -> float:
-    """Apply a server-authorized balance change and return the rounded result."""
-    updated = await redis_client.hincrbyfloat("ds:balances", user_id, amount)
-    return round(float(updated), 2)
+def clean_profile_name(value: object, fallback: str = "UNKNOWN PLAYER") -> str:
+    """Keep only compact, printable public identity metadata in persisted profiles."""
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    return (text[:64] or fallback)
+
+
+def clean_public_handle(value: object) -> str:
+    handle = str(value or "").strip().lstrip("@")
+    return handle if re.fullmatch(r"[A-Za-z0-9_]{5,32}", handle) else ""
+
+
+def profile_summary(profile: dict) -> dict:
+    """Return the Pit Boss-safe view of a profile without the raw Telegram user ID."""
+    return {
+        "ref": str(profile.get("ref", "")),
+        "name": clean_profile_name(profile.get("name")),
+        "public_handle": clean_public_handle(profile.get("public_handle")),
+        "balance": round(float(profile.get("balance", 0) or 0), 2),
+        "first_seen": int(profile.get("first_seen", 0) or 0),
+        "last_seen": int(profile.get("last_seen", 0) or 0),
+        "matches_entered": int(profile.get("matches_entered", 0) or 0),
+        "matches_survived": int(profile.get("matches_survived", 0) or 0),
+        "eliminations": int(profile.get("eliminations", 0) or 0),
+        "passes": int(profile.get("passes", 0) or 0),
+        "chips_granted": round(float(profile.get("chips_granted", 0) or 0), 2),
+        "chips_removed": round(float(profile.get("chips_removed", 0) or 0), 2),
+    }
+
+
+async def load_player_profile(user_id: str) -> dict | None:
+    raw = await redis_client.hget(PLAYER_PROFILES_KEY, user_id)
+    if not raw:
+        return None
+    try:
+        profile = json.loads(raw)
+        return profile if isinstance(profile, dict) else None
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+async def save_player_profile(user_id: str, profile: dict) -> None:
+    await redis_client.hset(PLAYER_PROFILES_KEY, user_id, json.dumps(profile, separators=(",", ":")))
+    await redis_client.hset(PLAYER_PROFILE_REFS_KEY, str(profile["ref"]), user_id)
+
+
+async def ensure_player_profile(
+    user_id: str,
+    verified_user: dict | None = None,
+    fallback_name: str = "",
+) -> dict:
+    """Create or refresh a durable profile using only verified Telegram identity fields."""
+    now = int(time.time())
+    profile = await load_player_profile(user_id)
+    if profile is None:
+        profile = {
+            "ref": secrets.token_urlsafe(9),
+            "name": clean_profile_name((verified_user or {}).get("first_name") or fallback_name),
+            "public_handle": clean_public_handle((verified_user or {}).get("username")),
+            "first_seen": now,
+            "last_seen": now,
+            "matches_entered": 0,
+            "matches_survived": 0,
+            "eliminations": 0,
+            "passes": 0,
+            "chips_granted": 0.0,
+            "chips_removed": 0.0,
+        }
+    else:
+        if verified_user:
+            profile["name"] = clean_profile_name(verified_user.get("first_name") or fallback_name, profile.get("name", "UNKNOWN PLAYER"))
+            profile["public_handle"] = clean_public_handle(verified_user.get("username"))
+        elif fallback_name:
+            profile["name"] = clean_profile_name(fallback_name, profile.get("name", "UNKNOWN PLAYER"))
+        profile["last_seen"] = now
+    profile["balance"] = await get_balance(user_id)
+    await save_player_profile(user_id, profile)
+    return profile
+
+
+async def update_player_profile(user_id: str, **increments: float) -> dict | None:
+    """Update server-managed profile totals after an already-authorized game event."""
+    profile = await load_player_profile(user_id)
+    if profile is None:
+        profile = await ensure_player_profile(user_id)
+    if profile is None:
+        return None
+    profile["last_seen"] = int(time.time())
+    profile["balance"] = await get_balance(user_id)
+    for key, value in increments.items():
+        if key not in {"matches_entered", "matches_survived", "eliminations", "passes", "chips_granted", "chips_removed"}:
+            continue
+        profile[key] = round(float(profile.get(key, 0) or 0) + float(value), 2)
+    await save_player_profile(user_id, profile)
+    return profile
+
+
+async def apply_balance_event(
+    user_id: str,
+    amount: float,
+    reason: str,
+    *,
+    actor_id: str | None = None,
+    round_ref: int | None = None,
+    metadata: dict | None = None,
+) -> float:
+    """Atomically persist a signed virtual-chip event, resulting balance, and bounded audit history."""
+    amount = round(float(amount), 2)
+    if not math.isfinite(amount) or amount == 0:
+        return await get_balance(user_id)
+
+    safe_reason = re.sub(r"[^a-z0-9_:-]", "", str(reason).lower())[:48] or "ledger_adjustment"
+    for _ in range(5):
+        async with redis_client.pipeline(transaction=True) as pipe:
+            try:
+                await pipe.watch(BALANCES_KEY)
+                raw_balance = await pipe.hget(BALANCES_KEY, user_id)
+                current = DEFAULT_BALANCE if raw_balance is None else float(raw_balance)
+                if not math.isfinite(current) or current < 0:
+                    current = DEFAULT_BALANCE
+                updated = round(current + amount, 2)
+                if updated < 0:
+                    raise ValueError("Insufficient virtual chips for this adjustment.")
+                event = {
+                    "event_id": secrets.token_urlsafe(12),
+                    "created_at": int(time.time()),
+                    "target_id": user_id,
+                    "actor_id": actor_id or "system",
+                    "amount": amount,
+                    "balance_after": updated,
+                    "reason": safe_reason,
+                    "round": int(round_ref or 0),
+                    "metadata": metadata or {},
+                }
+                encoded_event = json.dumps(event, separators=(",", ":"))
+                pipe.multi()
+                pipe.hset(BALANCES_KEY, user_id, updated)
+                pipe.lpush(f"{PLAYER_LEDGER_PREFIX}{user_id}", encoded_event)
+                pipe.ltrim(f"{PLAYER_LEDGER_PREFIX}{user_id}", 0, PLAYER_LEDGER_LIMIT - 1)
+                pipe.lpush(ADMIN_LEDGER_KEY, encoded_event)
+                pipe.ltrim(ADMIN_LEDGER_KEY, 0, ADMIN_LEDGER_LIMIT - 1)
+                await pipe.execute()
+                profile = await ensure_player_profile(user_id)
+                if profile:
+                    profile["balance"] = updated
+                    if amount > 0 and safe_reason.startswith("pit_boss"):
+                        profile["chips_granted"] = round(float(profile.get("chips_granted", 0)) + amount, 2)
+                    if amount < 0 and safe_reason.startswith("pit_boss"):
+                        profile["chips_removed"] = round(float(profile.get("chips_removed", 0)) + abs(amount), 2)
+                    await save_player_profile(user_id, profile)
+                return updated
+            except ValueError:
+                raise
+            except Exception as error:
+                if "WatchError" not in type(error).__name__:
+                    raise
+    raise RuntimeError("The chip ledger was busy. Try the adjustment again.")
+
+
+async def change_balance(
+    user_id: str,
+    amount: float,
+    reason: str = "ledger_adjustment",
+    *,
+    actor_id: str | None = None,
+    round_ref: int | None = None,
+    metadata: dict | None = None,
+) -> float:
+    """Compatibility wrapper for every authoritative balance change in game flow."""
+    return await apply_balance_event(
+        user_id,
+        amount,
+        reason,
+        actor_id=actor_id,
+        round_ref=round_ref,
+        metadata=metadata,
+    )
 
 
 async def claim_action_slot(user_id: str, action: str, cooldown_seconds: float) -> bool:
@@ -128,6 +310,117 @@ async def daily_claim_status(user_id: str) -> dict:
     if ttl is None or ttl < 0:
         return {"available": True, "seconds_until": 0, "amount": DAILY_CHIP_GRANT}
     return {"available": False, "seconds_until": int(ttl), "amount": DAILY_CHIP_GRANT}
+
+
+async def pit_boss_dashboard_payload(profile_ref: str = "", search: str = "") -> dict:
+    """Return bounded, reference-based administration data without exposing raw Telegram IDs to the client."""
+    existing_profiles = await redis_client.hgetall(PLAYER_PROFILES_KEY)
+    for existing_user_id in (await redis_client.hgetall(BALANCES_KEY)).keys():
+        if str(existing_user_id) not in existing_profiles:
+            await ensure_player_profile(str(existing_user_id), fallback_name="LEGACY PLAYER")
+    raw_profiles = await redis_client.hgetall(PLAYER_PROFILES_KEY)
+    needle = str(search or "").strip().lower()[:48]
+    profiles: list[dict] = []
+    selected_id = ""
+    for user_id, raw_profile in raw_profiles.items():
+        try:
+            profile = json.loads(raw_profile)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        summary = profile_summary(profile)
+        haystack = f"{summary['ref']} {summary['name']} {summary['public_handle']}".lower()
+        if needle and needle not in haystack:
+            continue
+        profiles.append(summary)
+        if summary["ref"] == profile_ref:
+            selected_id = str(user_id)
+    profiles.sort(key=lambda item: (item["last_seen"], item["name"].lower()), reverse=True)
+    profiles = profiles[:100]
+
+    ledger: list[dict] = []
+    if selected_id:
+        entries = await redis_client.lrange(f"{PLAYER_LEDGER_PREFIX}{selected_id}", 0, 49)
+        for entry in entries:
+            try:
+                event = json.loads(entry)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            ledger.append(
+                {
+                    "event_id": str(event.get("event_id", "")),
+                    "created_at": int(event.get("created_at", 0) or 0),
+                    "amount": round(float(event.get("amount", 0) or 0), 2),
+                    "balance_after": round(float(event.get("balance_after", 0) or 0), 2),
+                    "reason": str(event.get("reason", "ledger_adjustment"))[:48],
+                    "round": int(event.get("round", 0) or 0),
+                    "note": clean_profile_name((event.get("metadata") or {}).get("note"), "")[:96],
+                }
+            )
+
+    groups: list[dict] = []
+    for raw_group in (await redis_client.hgetall(REGISTERED_GROUPS_KEY)).values():
+        try:
+            group = json.loads(raw_group)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        groups.append(
+            {
+                "ref": str(group.get("ref", "")),
+                "title": clean_profile_name(group.get("title"), "UNKNOWN GROUP"),
+                "type": str(group.get("type", "group"))[:20],
+                "first_seen": int(group.get("first_seen", 0) or 0),
+                "last_played": int(group.get("last_played", 0) or 0),
+                "games_started": int(group.get("games_started", 0) or 0),
+                "games_completed": int(group.get("games_completed", 0) or 0),
+            }
+        )
+    groups.sort(key=lambda item: (item["last_played"], item["title"].lower()), reverse=True)
+    return {"profiles": profiles, "ledger": ledger, "groups": groups[:100], "selected_ref": profile_ref}
+
+
+async def register_telegram_group(chat: dict) -> dict | None:
+    """Persist only safe group metadata after an explicit in-group registration command."""
+    group_type = str(chat.get("type", ""))
+    chat_id = str(chat.get("id", ""))
+    if group_type not in {"group", "supergroup"} or not chat_id:
+        return None
+    now = int(time.time())
+    raw = await redis_client.hget(REGISTERED_GROUPS_KEY, chat_id)
+    try:
+        group = json.loads(raw) if raw else {}
+    except (TypeError, json.JSONDecodeError):
+        group = {}
+    group.update(
+        {
+            "ref": str(group.get("ref") or secrets.token_urlsafe(8)),
+            "title": clean_profile_name(chat.get("title"), "UNTITLED GROUP"),
+            "type": group_type,
+            "first_seen": int(group.get("first_seen") or now),
+            "last_played": int(group.get("last_played") or 0),
+            "games_started": int(group.get("games_started") or 0),
+            "games_completed": int(group.get("games_completed") or 0),
+        }
+    )
+    await redis_client.hset(REGISTERED_GROUPS_KEY, chat_id, json.dumps(group, separators=(",", ":")))
+    return {"chat_id": chat_id, **group}
+
+
+async def touch_registered_group(group_ref: str, field: str) -> None:
+    """Update public-safe group activity counters only for cards posted through explicit registration."""
+    if field not in {"games_started", "games_completed"}:
+        return
+    groups = await redis_client.hgetall(REGISTERED_GROUPS_KEY)
+    for chat_id, raw in groups.items():
+        try:
+            group = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if str(group.get("ref")) != str(group_ref):
+            continue
+        group[field] = int(group.get(field, 0) or 0) + 1
+        group["last_played"] = int(time.time())
+        await redis_client.hset(REGISTERED_GROUPS_KEY, chat_id, json.dumps(group, separators=(",", ":")))
+        return
 
 
 def verified_telegram_user(init_data: str) -> dict | None:
@@ -594,6 +887,13 @@ async def telegram_api_call(method: str, payload: dict) -> tuple[bool, dict]:
         return False, {}
 
 
+async def telegram_group_admin(chat_id: str, user_id: str) -> bool:
+    """Verify a caller administers the target group before recording group metadata."""
+    ok, result = await telegram_api_call("getChatMember", {"chat_id": chat_id, "user_id": user_id})
+    status = str(((result.get("result") or {}).get("status") or "")) if ok else ""
+    return status in {"creator", "administrator"}
+
+
 async def edit_inline_card(inline_message_id: str, text: str, markup: dict) -> bool:
     """Edit one tracked inline card and report whether Telegram accepted the edit."""
     ok, result = await telegram_api_call(
@@ -665,53 +965,138 @@ async def edit_inline_media(inline_message_id: str, poster_key: str, text: str, 
     return ok
 
 
+async def edit_group_caption(chat_id: str, message_id: int, text: str, markup: dict) -> bool:
+    """Update a registered group’s photo-card caption without exposing the group ID to Mini App clients."""
+    ok, result = await telegram_api_call(
+        "editMessageCaption",
+        {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "caption": text,
+            "parse_mode": "HTML",
+            "reply_markup": markup,
+        },
+    )
+    return ok or "message is not modified" in str(result.get("description", "")).lower()
+
+
+async def edit_group_media(chat_id: str, message_id: int, poster_key: str, text: str, markup: dict) -> bool:
+    """Transform a registered group’s native photo card at the authoritative elimination or final result."""
+    ok, _ = await telegram_api_call(
+        "editMessageMedia",
+        {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "media": {
+                "type": "photo",
+                "media": f"{PUBLIC_BACKEND_URL}/telegram/posters/{poster_key}.png",
+                "caption": text,
+                "parse_mode": "HTML",
+            },
+            "reply_markup": markup,
+        },
+    )
+    return ok
+
+
+async def send_registered_group_lobby_card(group: dict) -> bool:
+    """Send and track a photo-first lobby card after an explicit in-group registration command."""
+    chat_id = str(group.get("chat_id", ""))
+    if not chat_id:
+        return False
+    card = current_lobby_card()
+    ok, result = await telegram_api_call(
+        "sendPhoto",
+        {
+            "chat_id": chat_id,
+            "photo": card["photo_url"],
+            "caption": card["caption"],
+            "parse_mode": "HTML",
+            "reply_markup": card["reply_markup"],
+        },
+    )
+    message_id = (result.get("result") or {}).get("message_id") if ok else None
+    if not message_id:
+        return False
+    record = {"chat_id": chat_id, "message_id": int(message_id), "group_ref": group["ref"]}
+    await redis_client.hset(ACTIVE_GROUP_CARDS_KEY, f"{chat_id}:{message_id}", json.dumps(record, separators=(",", ":")))
+    return True
+
+
+async def active_group_cards() -> list[tuple[str, dict]]:
+    """Load valid native group cards; malformed records are discarded defensively."""
+    if not hasattr(redis_client, "hgetall"):
+        return []
+    records: list[tuple[str, dict]] = []
+    for card_key, raw in (await redis_client.hgetall(ACTIVE_GROUP_CARDS_KEY)).items():
+        try:
+            record = json.loads(raw)
+            if str(record.get("chat_id")) and int(record.get("message_id")):
+                records.append((card_key, record))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            await redis_client.hdel(ACTIVE_GROUP_CARDS_KEY, card_key)
+    return records
+
+
 async def refresh_lobby_cards() -> None:
     """Update every tracked lobby card from public authoritative game state."""
     card_ids = await redis_client.smembers(ACTIVE_LOBBY_CARDS_KEY)
-    if not card_ids:
-        return
     card = current_lobby_card()
     text = card["caption"]
     markup = card["reply_markup"]
-    outcomes = await asyncio.gather(
-        *(edit_inline_caption(card_id, text, markup) for card_id in card_ids)
-    )
+    outcomes = await asyncio.gather(*(edit_inline_caption(card_id, text, markup) for card_id in card_ids)) if card_ids else []
     stale_ids = [card_id for card_id, ok in zip(card_ids, outcomes) if not ok]
     if stale_ids:
         print(f"Removing {len(stale_ids)} stale Telegram inline card(s)")
         await redis_client.srem(ACTIVE_LOBBY_CARDS_KEY, *stale_ids)
+    group_cards = await active_group_cards()
+    group_outcomes = await asyncio.gather(
+        *(edit_group_caption(record["chat_id"], record["message_id"], text, markup) for _, record in group_cards)
+    ) if group_cards else []
+    stale_group_keys = [card_key for (card_key, _), ok in zip(group_cards, group_outcomes) if not ok]
+    if stale_group_keys:
+        await redis_client.hdel(ACTIVE_GROUP_CARDS_KEY, *stale_group_keys)
 
 
 async def publish_elimination_poster(loser: dict | None, survivors: list[dict]) -> None:
     """Transform every tracked group lobby card into the current public knockout poster."""
     card_ids = await redis_client.smembers(ACTIVE_LOBBY_CARDS_KEY)
-    if not card_ids:
-        return
     poster_key = cache_elimination_poster(loser, len(survivors))
     text, markup = current_elimination_card(loser, survivors)
-    outcomes = await asyncio.gather(
-        *(edit_inline_media(card_id, poster_key, text, markup) for card_id in card_ids)
-    )
+    outcomes = await asyncio.gather(*(edit_inline_media(card_id, poster_key, text, markup) for card_id in card_ids)) if card_ids else []
     stale_ids = [card_id for card_id, ok in zip(card_ids, outcomes) if not ok]
     if stale_ids:
         await redis_client.srem(ACTIVE_LOBBY_CARDS_KEY, *stale_ids)
+    group_cards = await active_group_cards()
+    group_outcomes = await asyncio.gather(
+        *(edit_group_media(record["chat_id"], record["message_id"], poster_key, text, markup) for _, record in group_cards)
+    ) if group_cards else []
+    stale_group_keys = [card_key for (card_key, _), ok in zip(group_cards, group_outcomes) if not ok]
+    if stale_group_keys:
+        await redis_client.hdel(ACTIVE_GROUP_CARDS_KEY, *stale_group_keys)
 
 
 async def publish_round_results(payout: float, survivors: list[dict]) -> None:
     """Transform the live group card into a winner-specific final photo result."""
     card_ids = await redis_client.smembers(ACTIVE_LOBBY_CARDS_KEY)
-    if not card_ids:
-        return
     text, markup = current_round_result_card(payout, survivors)
     winner = survivors[0] if survivors else None
     poster_key = cache_final_survivor_poster(winner, payout)
-    outcomes = await asyncio.gather(
-        *(edit_inline_media(card_id, poster_key, text, markup) for card_id in card_ids)
-    )
+    outcomes = await asyncio.gather(*(edit_inline_media(card_id, poster_key, text, markup) for card_id in card_ids)) if card_ids else []
     stale_ids = [card_id for card_id, ok in zip(card_ids, outcomes) if not ok]
     if stale_ids:
         await redis_client.srem(ACTIVE_LOBBY_CARDS_KEY, *stale_ids)
+    group_cards = await active_group_cards()
+    group_outcomes = await asyncio.gather(
+        *(edit_group_media(record["chat_id"], record["message_id"], poster_key, text, markup) for _, record in group_cards)
+    ) if group_cards else []
+    stale_group_keys = [card_key for (card_key, _), ok in zip(group_cards, group_outcomes) if not ok]
+    if stale_group_keys:
+        await redis_client.hdel(ACTIVE_GROUP_CARDS_KEY, *stale_group_keys)
+    for _, record in group_cards:
+        await touch_registered_group(record["group_ref"], "games_completed")
     await redis_client.delete(ACTIVE_LOBBY_CARDS_KEY)
+    await redis_client.delete(ACTIVE_GROUP_CARDS_KEY)
 
 
 async def register_telegram_webhook() -> None:
@@ -728,6 +1113,7 @@ async def register_telegram_webhook() -> None:
                 "inline_query",
                 "chosen_inline_result",
                 "callback_query",
+                "message",
             ],
             "drop_pending_updates": False,
         }
@@ -814,6 +1200,33 @@ async def telegram_webhook(
             "text": "The fuse is lit. Late entries are incinerated.",
             "show_alert": False,
         }
+
+    message = update.get("message") or {}
+    chat = message.get("chat") or {}
+    command = str(message.get("text") or "").strip().split(maxsplit=1)[0].lower()
+    if command.startswith("/register_dont_splode"):
+        chat_id = str(chat.get("id", ""))
+        actor_id = str((message.get("from") or {}).get("id", ""))
+        authorized = actor_id in PIT_BOSS_IDS or await telegram_group_admin(chat_id, actor_id)
+        if not authorized:
+            return {
+                "method": "sendMessage",
+                "chat_id": chat_id,
+                "text": "Only a group administrator or the Pit Boss may register this cabinet.",
+            }
+        group = await register_telegram_group(chat)
+        if not group:
+            return {
+                "method": "sendMessage",
+                "chat_id": chat_id,
+                "text": "This command belongs in a normal Telegram group, not a private chat.",
+            }
+        sent = await send_registered_group_lobby_card(group)
+        return {
+            "method": "sendMessage",
+            "chat_id": chat_id,
+            "text": "Cabinet registered. A live lobby card has been posted." if sent else "Cabinet registered, but Telegram refused the lobby card. Try again in a moment.",
+        }
     return {"ok": True}
 
 
@@ -885,6 +1298,8 @@ async def ignite_lobby(reason: str) -> bool:
     if game_state["phase"] != "lobby" or len(game_state["players"]) < 2:
         return False
     arm_next_round()
+    for _, record in await active_group_cards():
+        await touch_registered_group(record["group_ref"], "games_started")
     await refresh_lobby_cards()
     await manager.broadcast_state("start", ignition_reason=reason)
     asyncio.create_task(tick_bomb())
@@ -979,7 +1394,15 @@ async def detonate():
     payout = 0.0
     if is_final and survivors:
         payout = round(game_state["pot"], 2)
-        await change_balance(survivors[0]["id"], payout)
+        await change_balance(
+            survivors[0]["id"],
+            payout,
+            "final_survivor_payout",
+            round_ref=game_state["round_number"],
+        )
+        await update_player_profile(survivors[0]["id"], matches_survived=1)
+    if loser:
+        await update_player_profile(loser["id"], eliminations=1)
 
     if is_final:
         # Retain only public-safe match statistics after the lobby reopens.
@@ -1032,6 +1455,7 @@ async def websocket_endpoint(
         and verified_user_id in PIT_BOSS_IDS
     )
     await manager.connect(websocket, user_id, is_pit_boss)
+    await ensure_player_profile(user_id, verified_user, user_name)
     await manager.send_state(user_id, "welcome")
 
     try:
@@ -1060,7 +1484,13 @@ async def websocket_endpoint(
                     await reject_action(user_id, "The clerk is stamping your waiver. One moment.")
                     continue
 
-                await change_balance(user_id, -JOIN_COST)
+                await change_balance(
+                    user_id,
+                    -JOIN_COST,
+                    "join_buy_in",
+                    round_ref=game_state["round_number"],
+                )
+                await update_player_profile(user_id, matches_entered=1)
                 game_state["pot"] += JOIN_COST
                 game_state["players"].append({"id": user_id, "name": user_name, "public_handle": public_handle})
                 if (
@@ -1112,7 +1542,7 @@ async def websocket_endpoint(
                     )
                     continue
 
-                await change_balance(user_id, DAILY_CHIP_GRANT)
+                await change_balance(user_id, DAILY_CHIP_GRANT, "daily_chip_cache")
                 await manager.send_state(
                     user_id,
                     "daily_claimed",
@@ -1152,19 +1582,12 @@ async def websocket_endpoint(
                     await reject_action(user_id, "The chip drawer is already open. One moment.")
                     continue
 
-                await change_balance(target_id, grant_amount)
-                await redis_client.lpush(
-                    "ds:pit_boss_grants",
-                    json.dumps(
-                        {
-                            "admin_id": user_id,
-                            "recipient_id": target_id,
-                            "amount": grant_amount,
-                            "created_at": int(time.time()),
-                        }
-                    ),
+                await change_balance(
+                    target_id,
+                    grant_amount,
+                    "pit_boss_grant",
+                    actor_id=user_id,
                 )
-                await redis_client.ltrim("ds:pit_boss_grants", 0, 99)
                 await manager.send_state(
                     target_id,
                     "pit_boss_granted",
@@ -1176,6 +1599,77 @@ async def websocket_endpoint(
                         "pit_boss_grant_sent",
                         grant_amount=grant_amount,
                     )
+
+            elif action == "pit_boss_dashboard":
+                if user_id not in manager.pit_boss_connections:
+                    await reject_action(user_id, "Only a verified Pit Boss may inspect the cabinet ledger.")
+                    continue
+                profile_ref = str(data.get("profile_ref", ""))[:32]
+                search = clean_profile_name(data.get("search", ""), "")[:48]
+                dashboard = await pit_boss_dashboard_payload(profile_ref, search)
+                await manager.send_state(user_id, "pit_boss_dashboard", pit_boss_dashboard=dashboard)
+
+            elif action == "pit_boss_adjust":
+                if user_id not in manager.pit_boss_connections:
+                    await reject_action(user_id, "Only a verified Pit Boss may alter the cabinet ledger.")
+                    continue
+                target_ref = str(data.get("target_ref", ""))[:32]
+                target_id = await redis_client.hget(PLAYER_PROFILE_REFS_KEY, target_ref)
+                if not target_id:
+                    await reject_action(user_id, "Choose a known player profile before touching the ledger.")
+                    continue
+                direction = str(data.get("direction", "")).lower()
+                try:
+                    amount = float(data.get("amount"))
+                except (TypeError, ValueError):
+                    amount = 0.0
+                note = clean_profile_name(data.get("reason", ""), "")[:96]
+                if direction not in {"add", "remove"}:
+                    await reject_action(user_id, "Choose whether the cabinet adds or removes chips.")
+                    continue
+                if (
+                    not math.isfinite(amount)
+                    or amount != math.floor(amount)
+                    or not PIT_BOSS_MIN_GRANT <= amount <= PIT_BOSS_MAX_GRANT
+                ):
+                    await reject_action(
+                        user_id,
+                        f"Ledger adjustments must be whole amounts from {PIT_BOSS_MIN_GRANT:.0f} to {PIT_BOSS_MAX_GRANT:.0f} ◉.",
+                    )
+                    continue
+                if len(note.strip()) < 3:
+                    await reject_action(user_id, "Write a short reason before changing a persistent chip balance.")
+                    continue
+                if not await claim_action_slot(user_id, "pit_boss_adjust", PIT_BOSS_GRANT_COOLDOWN_SECONDS):
+                    await reject_action(user_id, "The ledger clerk is still stamping the last adjustment. One moment.")
+                    continue
+                signed_amount = amount if direction == "add" else -amount
+                try:
+                    updated_balance = await change_balance(
+                        str(target_id),
+                        signed_amount,
+                        f"pit_boss_{'credit' if direction == 'add' else 'debit'}",
+                        actor_id=user_id,
+                        metadata={"note": note},
+                    )
+                except ValueError:
+                    await reject_action(user_id, "The cabinet will not take a player below zero virtual chips.")
+                    continue
+                await manager.send_state(
+                    str(target_id),
+                    "pit_boss_adjusted",
+                    adjustment_amount=signed_amount,
+                    adjustment_reason=note,
+                )
+                dashboard = await pit_boss_dashboard_payload(target_ref)
+                await manager.send_state(
+                    user_id,
+                    "pit_boss_adjusted",
+                    adjustment_amount=signed_amount,
+                    adjustment_reason=note,
+                    adjustment_balance=updated_balance,
+                    pit_boss_dashboard=dashboard,
+                )
 
             elif action == "force_start":
                 await reject_action(
@@ -1191,7 +1685,13 @@ async def websocket_endpoint(
                             user_id, "pass", PASS_COOLDOWN_SECONDS
                         ):
                             continue
-                        await change_balance(user_id, -PASS_FEE)
+                        await change_balance(
+                            user_id,
+                            -PASS_FEE,
+                            "pass_fee",
+                            round_ref=game_state["round_number"],
+                        )
+                        await update_player_profile(user_id, passes=1)
                         game_state["pot"] += PASS_FEE
 
                         current_index = next(

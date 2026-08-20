@@ -15,6 +15,7 @@ async def run_checks() -> None:
 
     broadcasts: list[tuple[str, dict]] = []
     balance_changes: list[tuple[str, float]] = []
+    profile_updates: list[tuple[str, dict]] = []
     scheduled: list[str] = []
 
     async def no_op(*_args, **_kwargs):
@@ -23,17 +24,24 @@ async def run_checks() -> None:
     async def capture_broadcast(event_type: str, **extra):
         broadcasts.append((event_type, extra))
 
-    async def capture_balance(user_id: str, amount: float):
+    async def capture_balance(user_id: str, amount: float, *_args, **_kwargs):
         balance_changes.append((user_id, amount))
         return amount
 
+    async def capture_profile_update(user_id: str, **increments):
+        profile_updates.append((user_id, increments))
+        return {"id": user_id, **increments}
+
     main.refresh_lobby_cards = no_op
+    original_change_balance = main.change_balance
+    original_update_profile = main.update_player_profile
     original_publish_round_results = main.publish_round_results
     main.publish_round_results = no_op
     original_publish_elimination_poster = main.publish_elimination_poster
     main.publish_elimination_poster = no_op
     main.manager.broadcast_state = capture_broadcast
     main.change_balance = capture_balance
+    main.update_player_profile = capture_profile_update
     main.schedule_next_round = lambda: scheduled.append("next")
     main.schedule_lobby_reset = lambda: scheduled.append("reset")
     print("Simulating: One → Two → Three eliminated; Four takes the final pot.")
@@ -88,6 +96,8 @@ async def run_checks() -> None:
     assert [player["id"] for player in main.game_state["players"]] == ["four"]
     assert [player["id"] for player in main.game_state["eliminated_players"]] == ["one", "two", "three"]
     assert balance_changes == [("four", 415.0)]
+    assert ("one", {"eliminations": 1}) in profile_updates
+    assert ("four", {"matches_survived": 1}) in profile_updates
     assert broadcasts[-1][0] == "sploded"
     assert broadcasts[-1][1]["final"] is True
     assert scheduled == ["next", "next", "reset"]
@@ -322,11 +332,17 @@ async def run_checks() -> None:
 
     ignition_ticks: list[str] = []
     original_tick_bomb = main.tick_bomb
+    original_ignition_redis = main.redis_client
+
+    class EmptyGroupRedis:
+        async def hgetall(self, _key):
+            return {}
 
     async def fake_tick_bomb():
         ignition_ticks.append("tick")
 
     main.tick_bomb = fake_tick_bomb
+    main.redis_client = EmptyGroupRedis()
     try:
         def lobby_players(count: int) -> list[dict]:
             return [{"id": f"ready-{index}", "name": f"Ready {index}"} for index in range(count)]
@@ -384,6 +400,122 @@ async def run_checks() -> None:
         print("Reset guard: lobby readiness and auto-ignite countdown do not leak into the next match.")
     finally:
         main.tick_bomb = original_tick_bomb
+        main.redis_client = original_ignition_redis
+
+    class LedgerPipeline:
+        def __init__(self, redis):
+            self.redis = redis
+            self.commands = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def watch(self, *_args):
+            return True
+
+        async def hget(self, key, field):
+            return await self.redis.hget(key, field)
+
+        def multi(self):
+            return None
+
+        def hset(self, key, field, value):
+            self.commands.append(("hset", key, field, value))
+
+        def lpush(self, key, value):
+            self.commands.append(("lpush", key, value))
+
+        def ltrim(self, key, start, stop):
+            self.commands.append(("ltrim", key, start, stop))
+
+        async def execute(self):
+            for command, *args in self.commands:
+                await getattr(self.redis, command)(*args)
+            return True
+
+    class LedgerRedis:
+        def __init__(self):
+            self.hashes: dict[str, dict[str, str]] = {}
+            self.lists: dict[str, list[str]] = {}
+
+        def pipeline(self, transaction=True):
+            return LedgerPipeline(self)
+
+        async def hget(self, key, field):
+            return self.hashes.get(key, {}).get(str(field))
+
+        async def hset(self, key, field, value):
+            self.hashes.setdefault(key, {})[str(field)] = str(value)
+            return 1
+
+        async def hgetall(self, key):
+            return dict(self.hashes.get(key, {}))
+
+        async def lpush(self, key, value):
+            self.lists.setdefault(key, []).insert(0, str(value))
+            return len(self.lists[key])
+
+        async def ltrim(self, key, start, stop):
+            self.lists[key] = self.lists.get(key, [])[start : stop + 1]
+            return True
+
+        async def lrange(self, key, start, stop):
+            values = self.lists.get(key, [])
+            return values[start:] if stop == -1 else values[start : stop + 1]
+
+    ledger_redis = LedgerRedis()
+    main.redis_client = ledger_redis
+    main.change_balance = original_change_balance
+    main.update_player_profile = original_update_profile
+    try:
+        player = await main.ensure_player_profile(
+            "verified-ledger-user",
+            {"first_name": "Ledger Player", "username": "ledgerplayer"},
+        )
+        assert player["balance"] == main.DEFAULT_BALANCE
+        assert player["public_handle"] == "ledgerplayer"
+        assert await main.apply_balance_event("verified-ledger-user", -100, "join_buy_in", round_ref=1) == 400.0
+        assert await main.apply_balance_event("verified-ledger-user", 25, "pit_boss_credit", actor_id="pit-boss", metadata={"note": "QA refill"}) == 425.0
+        try:
+            await main.apply_balance_event("verified-ledger-user", -426, "pit_boss_debit", actor_id="pit-boss", metadata={"note": "Overdraw"})
+            raise AssertionError("Negative balances must be rejected")
+        except ValueError:
+            pass
+        profile = await main.load_player_profile("verified-ledger-user")
+        assert profile and profile["balance"] == 425.0 and profile["chips_granted"] == 25.0
+        events = await ledger_redis.lrange(f"{main.PLAYER_LEDGER_PREFIX}verified-ledger-user", 0, -1)
+        assert len(events) == 2
+        dashboard = await main.pit_boss_dashboard_payload(profile["ref"])
+        assert dashboard["profiles"][0]["public_handle"] == "ledgerplayer"
+        assert "verified-ledger-user" not in str(dashboard)
+        group = await main.register_telegram_group({"id": -100123, "type": "supergroup", "title": "Cabinet QA"})
+        assert group and group["title"] == "Cabinet QA"
+        await main.touch_registered_group(group["ref"], "games_started")
+        refreshed_dashboard = await main.pit_boss_dashboard_payload()
+        assert refreshed_dashboard["groups"][0]["games_started"] == 1
+        assert "-100123" not in str(refreshed_dashboard)
+        native_card_calls: list[tuple[str, dict]] = []
+
+        async def capture_native_card(method: str, payload: dict):
+            native_card_calls.append((method, payload))
+            return True, {"result": {"message_id": 77}}
+
+        main.telegram_api_call = capture_native_card
+        assert await main.send_registered_group_lobby_card({"chat_id": "-100123", "ref": group["ref"]})
+        stored_cards = await main.active_group_cards()
+        assert stored_cards[0][1]["group_ref"] == group["ref"]
+        assert native_card_calls[0][0] == "sendPhoto"
+        assert await main.edit_group_media("-100123", 77, "elimination-qa", "Public result", {"inline_keyboard": []})
+        assert native_card_calls[-1][0] == "editMessageMedia"
+        assert native_card_calls[-1][1]["media"]["media"].endswith("/elimination-qa.png")
+        assert "-100123" not in str(refreshed_dashboard)
+        print("Ledger guard: profiles, signed events, non-negative debits, and public-safe group registry all hold.")
+    finally:
+        main.redis_client = original_redis
+        main.telegram_api_call = original_telegram_call
 
 
 if __name__ == "__main__":
