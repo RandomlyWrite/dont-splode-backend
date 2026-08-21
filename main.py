@@ -1094,7 +1094,7 @@ class ConnectionManager:
             await connection.send_json(
                 {
                     "type": event_type,
-                    "state": game_state,
+                    "state": public_game_state(),
                     "balance": await get_balance(user_id),
                     "daily_claim": await daily_claim_status(user_id),
                     "leaderboard": await public_leaderboard_payload(
@@ -1140,6 +1140,23 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+
+
+def public_game_state() -> dict:
+    """Redact the live server seed and crash point while a round is running.
+
+    game_state is broadcast wholesale on every event, which previously leaked
+    the round's crash multiplier and unhashed seed the instant a round armed
+    -- before the fuse even started ticking. Both values are restored once the
+    round has actually ended (intermission/ended/lobby), so clients can still
+    verify hashed_seed == sha256(server_seed) and reproduce crash_point via
+    generate_crash() after the fact, which is what "provably fair" requires.
+    """
+    safe = dict(game_state)
+    if safe.get("phase") == "running":
+        safe["server_seed"] = ""
+        safe["crash_point"] = None
+    return safe
 
 
 async def reject_action(user_id: str, reason: str) -> None:
@@ -1897,6 +1914,81 @@ async def detonate():
     schedule_next_round()
 
 
+async def handle_player_disconnect(user_id: str) -> None:
+    """Remove a dropped connection from the active game instead of letting it brick the round.
+
+    Previously ConnectionManager.disconnect() only cleaned up socket bookkeeping.
+    A player who rage-quit mid-round while holding the bomb stayed current_holder
+    forever, freezing every other player's ability to pass with no refund path.
+    """
+    if game_state["phase"] == "lobby":
+        if any(player["id"] == user_id for player in game_state["players"]):
+            game_state["players"] = [p for p in game_state["players"] if p["id"] != user_id]
+            ready_players = {str(pid) for pid in game_state.get("ready_players", [])}
+            ready_players.discard(user_id)
+            game_state["ready_players"] = sorted(ready_players)
+            await refresh_lobby_cards()
+            await manager.broadcast_state("update")
+        return
+
+    if game_state["phase"] not in {"running", "intermission"}:
+        return
+
+    if not any(player["id"] == user_id for player in game_state["players"]):
+        return
+
+    was_holder = game_state["current_holder"] == user_id
+    survivors = [p for p in game_state["players"] if p["id"] != user_id]
+    game_state["players"] = survivors
+    game_state["eliminated_players"].append({"id": user_id, "name": "DISCONNECTED", "public_handle": ""})
+
+    if not survivors:
+        game_state["current_holder"] = None
+        game_state["phase"] = "ended"
+        game_state["latest_round"] = {
+            "multiplier": round(game_state["multiplier"], 2),
+            "payout": 0.0,
+            "survivor_count": 0,
+            "eliminations": len(game_state["eliminated_players"]),
+            "rounds": game_state["round_number"],
+        }
+        await manager.broadcast_state(
+            "sploded", loser=user_id, loser_name="DISCONNECTED", payout=0.0, final=True
+        )
+        schedule_lobby_reset()
+        return
+
+    if len(survivors) == 1:
+        payout = round(game_state["pot"], 2)
+        await change_balance(
+            survivors[0]["id"], payout, "final_survivor_payout", round_ref=game_state["round_number"]
+        )
+        await update_player_profile(survivors[0]["id"], matches_survived=1, total_pot_won=payout)
+        for group_ref, participant_ids in list(round_group_rosters.items()):
+            await record_group_match_results(group_ref, participant_ids, survivors[0]["id"], payout)
+        game_state["phase"] = "ended"
+        game_state["current_holder"] = None
+        game_state["latest_round"] = {
+            "multiplier": round(game_state["multiplier"], 2),
+            "payout": payout,
+            "survivor_count": 1,
+            "eliminations": len(game_state["eliminated_players"]),
+            "rounds": game_state["round_number"],
+        }
+        await publish_round_results(payout, survivors)
+        await manager.broadcast_state(
+            "sploded", loser=user_id, loser_name="DISCONNECTED", payout=payout, final=True
+        )
+        schedule_lobby_reset()
+        return
+
+    if was_holder:
+        game_state["current_holder"] = survivors[0]["id"]
+    await manager.broadcast_state(
+        "player_disconnected", loser=user_id, loser_name="DISCONNECTED", remaining_players=len(survivors)
+    )
+
+
 @app.websocket("/ws/{user_id}/{user_name}")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -2244,3 +2336,5 @@ async def websocket_endpoint(
 
     except WebSocketDisconnect:
         manager.disconnect(user_id, websocket)
+        if manager.active_connections.get(user_id) is None:
+            await handle_player_disconnect(user_id)
