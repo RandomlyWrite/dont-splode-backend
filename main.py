@@ -103,6 +103,15 @@ intermission_task = None
 lobby_ignition_task = None
 round_group_rosters: dict[str, set[str]] = {}
 
+# Every task that reads-then-mutates game_state must hold this before touching it.
+# Without it, two coroutines interleaving across an `await` (a Redis round-trip, a
+# Telegram call) can each act on a game_state snapshot that's gone stale by the
+# time they resume -- e.g. a bomb detonating mid-`pass` while the passer still
+# thinks they're holding it. asyncio.Lock is non-reentrant, so nothing that runs
+# *inside* the lock (arm_next_round, detonate, ignite_lobby, etc.) may acquire it
+# again -- only the outer entry points below do that.
+game_lock = asyncio.Lock()
+
 
 async def get_balance(user_id: str) -> float:
     """Return a validated, persistent server-side balance for one player."""
@@ -1729,9 +1738,10 @@ async def reset_lobby_after_cooldown():
     global reset_task
     try:
         await asyncio.sleep(FINAL_LOBBY_RESET_SECONDS)
-        if game_state["phase"] == "ended":
-            reset_round_state()
-            await manager.broadcast_state("reset")
+        async with game_lock:
+            if game_state["phase"] == "ended":
+                reset_round_state()
+                await manager.broadcast_state("reset")
     finally:
         reset_task = None
 
@@ -1800,9 +1810,12 @@ async def watch_lobby_ignition() -> None:
     global lobby_ignition_task
     try:
         while game_state["phase"] == "lobby":
-            if await maybe_ignite_lobby():
-                return
-            auto_start_at = float(game_state.get("lobby_auto_start_at") or 0)
+            async with game_lock:
+                if game_state["phase"] != "lobby":
+                    return
+                if await maybe_ignite_lobby():
+                    return
+                auto_start_at = float(game_state.get("lobby_auto_start_at") or 0)
             if not auto_start_at:
                 return
             await asyncio.sleep(min(1.0, max(0.1, auto_start_at - time.time())))
@@ -1821,11 +1834,12 @@ async def resume_after_elimination():
     global intermission_task
     try:
         await asyncio.sleep(ELIMINATION_INTERMISSION_SECONDS)
-        if game_state["phase"] != "intermission" or len(game_state["players"]) < 2:
-            return
-        arm_next_round()
-        await refresh_lobby_cards()
-        await manager.broadcast_state("next_round")
+        async with game_lock:
+            if game_state["phase"] != "intermission" or len(game_state["players"]) < 2:
+                return
+            arm_next_round()
+            await refresh_lobby_cards()
+            await manager.broadcast_state("next_round")
         asyncio.create_task(tick_bomb())
     finally:
         intermission_task = None
@@ -1841,13 +1855,16 @@ async def tick_bomb():
     try:
         while game_state["phase"] == "running":
             await asyncio.sleep(ROUND_TICK_SECONDS)
-            game_state["multiplier"] = round(game_state["multiplier"] + 0.25, 2)
+            async with game_lock:
+                if game_state["phase"] != "running":
+                    break
+                game_state["multiplier"] = round(game_state["multiplier"] + 0.25, 2)
 
-            if game_state["multiplier"] >= game_state["crash_point"]:
-                await detonate()
-                break
+                if game_state["multiplier"] >= game_state["crash_point"]:
+                    await detonate()
+                    break
 
-            await manager.broadcast_state("tick")
+                await manager.broadcast_state("tick")
     except asyncio.CancelledError:
         pass
 
@@ -2022,319 +2039,321 @@ async def websocket_endpoint(
                 break
             action = data.get("action")
 
-            if action == "join":
-                if manager.spectator_contexts.get(user_id):
-                    await reject_action(user_id, "This cabinet launch is watch-only. Enter through a live lobby card to sign the waiver.")
-                    continue
-                if game_state["phase"] != "lobby":
-                    await reject_action(user_id, "The lobby is sealed. This fuse already has victims.")
-                    continue
+            async with game_lock:
+                if action == "join":
+                    if manager.spectator_contexts.get(user_id):
+                        await reject_action(user_id, "This cabinet launch is watch-only. Enter through a live lobby card to sign the waiver.")
+                        continue
+                    if game_state["phase"] != "lobby":
+                        await reject_action(user_id, "The lobby is sealed. This fuse already has victims.")
+                        continue
 
-                if any(player["id"] == user_id for player in game_state["players"]):
-                    await reject_action(user_id, "You already signed the waiver. Try not to enjoy it.")
-                    continue
+                    if any(player["id"] == user_id for player in game_state["players"]):
+                        await reject_action(user_id, "You already signed the waiver. Try not to enjoy it.")
+                        continue
 
-                balance = await get_balance(user_id)
-                if balance < JOIN_COST:
-                    await reject_action(user_id, "You need 100 ◉ to sign this waiver.")
-                    continue
+                    balance = await get_balance(user_id)
+                    if balance < JOIN_COST:
+                        await reject_action(user_id, "You need 100 ◉ to sign this waiver.")
+                        continue
 
-                if not await claim_action_slot(user_id, "join", JOIN_COOLDOWN_SECONDS):
-                    await reject_action(user_id, "The clerk is stamping your waiver. One moment.")
-                    continue
+                    if not await claim_action_slot(user_id, "join", JOIN_COOLDOWN_SECONDS):
+                        await reject_action(user_id, "The clerk is stamping your waiver. One moment.")
+                        continue
 
-                await change_balance(
-                    user_id,
-                    -JOIN_COST,
-                    "join_buy_in",
-                    round_ref=game_state["round_number"],
-                )
-                await update_player_profile(user_id, matches_entered=1)
-                game_state["pot"] += JOIN_COST
-                game_state["players"].append({"id": user_id, "name": user_name, "public_handle": public_handle})
-                if signed_group_ref:
-                    round_group_rosters.setdefault(signed_group_ref, set()).add(user_id)
-                if (
-                    len(game_state["players"]) >= MINIMUM_COUNTDOWN_PLAYERS
-                    and not game_state.get("lobby_auto_start_at")
-                ):
-                    game_state["lobby_auto_start_at"] = time.time() + LOBBY_AUTO_IGNITE_SECONDS
-                    schedule_lobby_ignition()
-                if not await maybe_ignite_lobby():
-                    await refresh_lobby_cards()
-                    await manager.broadcast_state("update")
-
-            elif action == "light_it_up":
-                if game_state["phase"] != "lobby":
-                    await reject_action(user_id, "The fuse is already lit. Keep your hands off the matchbook.")
-                    continue
-                if user_id not in lobby_player_ids():
-                    await reject_action(user_id, "Sign the waiver before trying to light anything.")
-                    continue
-                ready_players = {str(player_id) for player_id in game_state.get("ready_players", [])}
-                if user_id not in ready_players:
-                    ready_players.add(user_id)
-                    game_state["ready_players"] = sorted(ready_players)
-                if not await maybe_ignite_lobby():
-                    await refresh_lobby_cards()
-                    await manager.broadcast_state("ready_changed")
-
-            elif action == "cool_it_down":
-                ready_players = {str(player_id) for player_id in game_state.get("ready_players", [])}
-                if user_id in ready_players and game_state["phase"] == "lobby":
-                    ready_players.discard(user_id)
-                    game_state["ready_players"] = sorted(ready_players)
-                    await refresh_lobby_cards()
-                    await manager.broadcast_state("ready_changed")
-
-            elif action == "claim_daily":
-                claim_key = f"ds:daily_claims:{user_id}"
-                claimed = await redis_client.set(
-                    claim_key,
-                    "1",
-                    nx=True,
-                    ex=DAILY_CLAIM_COOLDOWN_SECONDS,
-                )
-                if not claimed:
-                    status = await daily_claim_status(user_id)
-                    await reject_action(
+                    await change_balance(
                         user_id,
-                        f"The chip cache is empty. Return in {status['seconds_until']} seconds.",
+                        -JOIN_COST,
+                        "join_buy_in",
+                        round_ref=game_state["round_number"],
                     )
-                    continue
+                    await update_player_profile(user_id, matches_entered=1)
+                    game_state["pot"] += JOIN_COST
+                    game_state["players"].append({"id": user_id, "name": user_name, "public_handle": public_handle})
+                    if signed_group_ref:
+                        round_group_rosters.setdefault(signed_group_ref, set()).add(user_id)
+                    if (
+                        len(game_state["players"]) >= MINIMUM_COUNTDOWN_PLAYERS
+                        and not game_state.get("lobby_auto_start_at")
+                    ):
+                        game_state["lobby_auto_start_at"] = time.time() + LOBBY_AUTO_IGNITE_SECONDS
+                        schedule_lobby_ignition()
+                    if not await maybe_ignite_lobby():
+                        await refresh_lobby_cards()
+                        await manager.broadcast_state("update")
 
-                await change_balance(user_id, DAILY_CHIP_GRANT, "daily_chip_cache")
-                await manager.send_state(
-                    user_id,
-                    "daily_claimed",
-                    claim_amount=DAILY_CHIP_GRANT,
-                )
-                await manager.broadcast_leaderboard()
+                elif action == "light_it_up":
+                    if game_state["phase"] != "lobby":
+                        await reject_action(user_id, "The fuse is already lit. Keep your hands off the matchbook.")
+                        continue
+                    if user_id not in lobby_player_ids():
+                        await reject_action(user_id, "Sign the waiver before trying to light anything.")
+                        continue
+                    ready_players = {str(player_id) for player_id in game_state.get("ready_players", [])}
+                    if user_id not in ready_players:
+                        ready_players.add(user_id)
+                        game_state["ready_players"] = sorted(ready_players)
+                    if not await maybe_ignite_lobby():
+                        await refresh_lobby_cards()
+                        await manager.broadcast_state("ready_changed")
 
-            elif action == "leaderboard":
-                requested_view = "chips" if str(data.get("view", "")).lower() == "chips" else "competitive"
-                requested_scope = str(data.get("scope", "")).lower()
-                manager.leaderboard_views[user_id] = requested_view
-                manager.leaderboard_scopes[user_id] = manager.group_contexts.get(user_id, "") if requested_scope == "group" else ""
-                await manager.send_state(user_id, "leaderboard")
+                elif action == "cool_it_down":
+                    ready_players = {str(player_id) for player_id in game_state.get("ready_players", [])}
+                    if user_id in ready_players and game_state["phase"] == "lobby":
+                        ready_players.discard(user_id)
+                        game_state["ready_players"] = sorted(ready_players)
+                        await refresh_lobby_cards()
+                        await manager.broadcast_state("ready_changed")
 
-            elif action == "season_archive":
-                group_ref = manager.group_contexts.get(user_id, "")
-                if not group_ref:
-                    await reject_action(user_id, "Open the cabinet from a registered group card to inspect that group’s season file.")
-                    continue
-                await manager.send_state(
-                    user_id,
-                    "season_archive",
-                    group_seasons=await group_season_archive_payload(group_ref),
-                )
-
-            elif action == "spectator_reaction":
-                if not manager.spectator_contexts.get(user_id):
-                    await reject_action(user_id, "Only watch-only cabinet visitors may trigger the reaction rail.")
-                    continue
-                if game_state["phase"] not in {"running", "intermission"}:
-                    await reject_action(user_id, "The reaction rail wakes only while the fuse is live or the ash is settling.")
-                    continue
-                reaction = str(data.get("reaction", ""))
-                if reaction not in SPECTATOR_REACTIONS:
-                    await reject_action(user_id, "That reaction is not mounted on this cabinet.")
-                    continue
-                if not await claim_action_slot(user_id, "spectator_reaction", SPECTATOR_REACTION_COOLDOWN_SECONDS):
-                    await reject_action(user_id, "The reaction rail needs a moment before another outburst.")
-                    continue
-                await manager.broadcast_spectator_reaction(reaction)
-
-            elif action == "pit_boss_master_reset":
-                if user_id not in manager.pit_boss_connections:
-                    await reject_action(user_id, "Only a verified Pit Boss may reset the virtual chip cabinet.")
-                    continue
-                if game_state["phase"] != "lobby" or game_state["players"]:
-                    await reject_action(user_id, "Master reset is locked until the lobby is empty and no fuse is active.")
-                    continue
-                confirmation = str(data.get("confirmation", "")).strip().upper()
-                note = clean_profile_name(data.get("reason", ""), "")[:96]
-                if confirmation != MASTER_RESET_PHRASE:
-                    await reject_action(user_id, f"Type {MASTER_RESET_PHRASE} exactly before resetting every virtual stack.")
-                    continue
-                if len(note.strip()) < 3:
-                    await reject_action(user_id, "Write a short reset reason for the cabinet audit file.")
-                    continue
-                if not await claim_action_slot(user_id, "pit_boss_master_reset", MASTER_RESET_COOLDOWN_SECONDS):
-                    await reject_action(user_id, "The master reset lever is cooling down. One moment.")
-                    continue
-                changed_count = await master_reset_virtual_chips(user_id, note)
-                dashboard = await pit_boss_dashboard_payload()
-                await manager.send_state(
-                    user_id,
-                    "pit_boss_master_reset",
-                    reset_count=changed_count,
-                    pit_boss_dashboard=dashboard,
-                )
-                await manager.broadcast_leaderboard()
-
-            elif action == "pit_boss_grant":
-                if user_id not in manager.pit_boss_connections:
-                    await reject_action(user_id, "Only a verified Pit Boss may open the chip drawer.")
-                    continue
-
-                target_id = str(data.get("target_id", ""))
-                if not any(player["id"] == target_id for player in game_state["players"]):
-                    await reject_action(user_id, "Select a currently listed victim before issuing chips.")
-                    continue
-
-                try:
-                    grant_amount = float(data.get("amount"))
-                except (TypeError, ValueError):
-                    await reject_action(user_id, "Enter a whole chip amount before opening the drawer.")
-                    continue
-
-                if (
-                    not math.isfinite(grant_amount)
-                    or grant_amount != math.floor(grant_amount)
-                    or not PIT_BOSS_MIN_GRANT <= grant_amount <= PIT_BOSS_MAX_GRANT
-                ):
-                    await reject_action(
-                        user_id,
-                        f"Pit Boss grants must be whole amounts from {PIT_BOSS_MIN_GRANT:.0f} to {PIT_BOSS_MAX_GRANT:.0f} ◉.",
+                elif action == "claim_daily":
+                    claim_key = f"ds:daily_claims:{user_id}"
+                    claimed = await redis_client.set(
+                        claim_key,
+                        "1",
+                        nx=True,
+                        ex=DAILY_CLAIM_COOLDOWN_SECONDS,
                     )
-                    continue
+                    if not claimed:
+                        status = await daily_claim_status(user_id)
+                        await reject_action(
+                            user_id,
+                            f"The chip cache is empty. Return in {status['seconds_until']} seconds.",
+                        )
+                        continue
 
-                if not await claim_action_slot(
-                    user_id, "pit_boss", PIT_BOSS_GRANT_COOLDOWN_SECONDS
-                ):
-                    await reject_action(user_id, "The chip drawer is already open. One moment.")
-                    continue
-
-                await change_balance(
-                    target_id,
-                    grant_amount,
-                    "pit_boss_grant",
-                    actor_id=user_id,
-                )
-                await manager.send_state(
-                    target_id,
-                    "pit_boss_granted",
-                    grant_amount=grant_amount,
-                )
-                if target_id != user_id:
+                    await change_balance(user_id, DAILY_CHIP_GRANT, "daily_chip_cache")
                     await manager.send_state(
                         user_id,
-                        "pit_boss_grant_sent",
+                        "daily_claimed",
+                        claim_amount=DAILY_CHIP_GRANT,
+                    )
+                    await manager.broadcast_leaderboard()
+
+                elif action == "leaderboard":
+                    requested_view = "chips" if str(data.get("view", "")).lower() == "chips" else "competitive"
+                    requested_scope = str(data.get("scope", "")).lower()
+                    manager.leaderboard_views[user_id] = requested_view
+                    manager.leaderboard_scopes[user_id] = manager.group_contexts.get(user_id, "") if requested_scope == "group" else ""
+                    await manager.send_state(user_id, "leaderboard")
+
+                elif action == "season_archive":
+                    group_ref = manager.group_contexts.get(user_id, "")
+                    if not group_ref:
+                        await reject_action(user_id, "Open the cabinet from a registered group card to inspect that group’s season file.")
+                        continue
+                    await manager.send_state(
+                        user_id,
+                        "season_archive",
+                        group_seasons=await group_season_archive_payload(group_ref),
+                    )
+
+                elif action == "spectator_reaction":
+                    if not manager.spectator_contexts.get(user_id):
+                        await reject_action(user_id, "Only watch-only cabinet visitors may trigger the reaction rail.")
+                        continue
+                    if game_state["phase"] not in {"running", "intermission"}:
+                        await reject_action(user_id, "The reaction rail wakes only while the fuse is live or the ash is settling.")
+                        continue
+                    reaction = str(data.get("reaction", ""))
+                    if reaction not in SPECTATOR_REACTIONS:
+                        await reject_action(user_id, "That reaction is not mounted on this cabinet.")
+                        continue
+                    if not await claim_action_slot(user_id, "spectator_reaction", SPECTATOR_REACTION_COOLDOWN_SECONDS):
+                        await reject_action(user_id, "The reaction rail needs a moment before another outburst.")
+                        continue
+                    await manager.broadcast_spectator_reaction(reaction)
+
+                elif action == "pit_boss_master_reset":
+                    if user_id not in manager.pit_boss_connections:
+                        await reject_action(user_id, "Only a verified Pit Boss may reset the virtual chip cabinet.")
+                        continue
+                    if game_state["phase"] != "lobby" or game_state["players"]:
+                        await reject_action(user_id, "Master reset is locked until the lobby is empty and no fuse is active.")
+                        continue
+                    confirmation = str(data.get("confirmation", "")).strip().upper()
+                    note = clean_profile_name(data.get("reason", ""), "")[:96]
+                    if confirmation != MASTER_RESET_PHRASE:
+                        await reject_action(user_id, f"Type {MASTER_RESET_PHRASE} exactly before resetting every virtual stack.")
+                        continue
+                    if len(note.strip()) < 3:
+                        await reject_action(user_id, "Write a short reset reason for the cabinet audit file.")
+                        continue
+                    if not await claim_action_slot(user_id, "pit_boss_master_reset", MASTER_RESET_COOLDOWN_SECONDS):
+                        await reject_action(user_id, "The master reset lever is cooling down. One moment.")
+                        continue
+                    changed_count = await master_reset_virtual_chips(user_id, note)
+                    dashboard = await pit_boss_dashboard_payload()
+                    await manager.send_state(
+                        user_id,
+                        "pit_boss_master_reset",
+                        reset_count=changed_count,
+                        pit_boss_dashboard=dashboard,
+                    )
+                    await manager.broadcast_leaderboard()
+
+                elif action == "pit_boss_grant":
+                    if user_id not in manager.pit_boss_connections:
+                        await reject_action(user_id, "Only a verified Pit Boss may open the chip drawer.")
+                        continue
+
+                    target_id = str(data.get("target_id", ""))
+                    if not any(player["id"] == target_id for player in game_state["players"]):
+                        await reject_action(user_id, "Select a currently listed victim before issuing chips.")
+                        continue
+
+                    try:
+                        grant_amount = float(data.get("amount"))
+                    except (TypeError, ValueError):
+                        await reject_action(user_id, "Enter a whole chip amount before opening the drawer.")
+                        continue
+
+                    if (
+                        not math.isfinite(grant_amount)
+                        or grant_amount != math.floor(grant_amount)
+                        or not PIT_BOSS_MIN_GRANT <= grant_amount <= PIT_BOSS_MAX_GRANT
+                    ):
+                        await reject_action(
+                            user_id,
+                            f"Pit Boss grants must be whole amounts from {PIT_BOSS_MIN_GRANT:.0f} to {PIT_BOSS_MAX_GRANT:.0f} ◉.",
+                        )
+                        continue
+
+                    if not await claim_action_slot(
+                        user_id, "pit_boss", PIT_BOSS_GRANT_COOLDOWN_SECONDS
+                    ):
+                        await reject_action(user_id, "The chip drawer is already open. One moment.")
+                        continue
+
+                    await change_balance(
+                        target_id,
+                        grant_amount,
+                        "pit_boss_grant",
+                        actor_id=user_id,
+                    )
+                    await manager.send_state(
+                        target_id,
+                        "pit_boss_granted",
                         grant_amount=grant_amount,
                     )
-                await manager.broadcast_leaderboard()
+                    if target_id != user_id:
+                        await manager.send_state(
+                            user_id,
+                            "pit_boss_grant_sent",
+                            grant_amount=grant_amount,
+                        )
+                    await manager.broadcast_leaderboard()
 
-            elif action == "pit_boss_dashboard":
-                if user_id not in manager.pit_boss_connections:
-                    await reject_action(user_id, "Only a verified Pit Boss may inspect the cabinet ledger.")
-                    continue
-                profile_ref = str(data.get("profile_ref", ""))[:32]
-                search = clean_profile_name(data.get("search", ""), "")[:48]
-                sort = str(data.get("sort", "balance_desc"))[:24]
-                dashboard = await pit_boss_dashboard_payload(profile_ref, search, sort)
-                await manager.send_state(user_id, "pit_boss_dashboard", pit_boss_dashboard=dashboard)
+                elif action == "pit_boss_dashboard":
+                    if user_id not in manager.pit_boss_connections:
+                        await reject_action(user_id, "Only a verified Pit Boss may inspect the cabinet ledger.")
+                        continue
+                    profile_ref = str(data.get("profile_ref", ""))[:32]
+                    search = clean_profile_name(data.get("search", ""), "")[:48]
+                    sort = str(data.get("sort", "balance_desc"))[:24]
+                    dashboard = await pit_boss_dashboard_payload(profile_ref, search, sort)
+                    await manager.send_state(user_id, "pit_boss_dashboard", pit_boss_dashboard=dashboard)
 
-            elif action == "pit_boss_adjust":
-                if user_id not in manager.pit_boss_connections:
-                    await reject_action(user_id, "Only a verified Pit Boss may alter the cabinet ledger.")
-                    continue
-                target_ref = str(data.get("target_ref", ""))[:32]
-                target_id = await redis_client.hget(PLAYER_PROFILE_REFS_KEY, target_ref)
-                if not target_id:
-                    await reject_action(user_id, "Choose a known player profile before touching the ledger.")
-                    continue
-                direction = str(data.get("direction", "")).lower()
-                try:
-                    amount = float(data.get("amount"))
-                except (TypeError, ValueError):
-                    amount = 0.0
-                note = clean_profile_name(data.get("reason", ""), "")[:96]
-                if direction not in {"add", "remove"}:
-                    await reject_action(user_id, "Choose whether the cabinet adds or removes chips.")
-                    continue
-                if (
-                    not math.isfinite(amount)
-                    or amount != math.floor(amount)
-                    or not PIT_BOSS_MIN_GRANT <= amount <= PIT_BOSS_MAX_GRANT
-                ):
+                elif action == "pit_boss_adjust":
+                    if user_id not in manager.pit_boss_connections:
+                        await reject_action(user_id, "Only a verified Pit Boss may alter the cabinet ledger.")
+                        continue
+                    target_ref = str(data.get("target_ref", ""))[:32]
+                    target_id = await redis_client.hget(PLAYER_PROFILE_REFS_KEY, target_ref)
+                    if not target_id:
+                        await reject_action(user_id, "Choose a known player profile before touching the ledger.")
+                        continue
+                    direction = str(data.get("direction", "")).lower()
+                    try:
+                        amount = float(data.get("amount"))
+                    except (TypeError, ValueError):
+                        amount = 0.0
+                    note = clean_profile_name(data.get("reason", ""), "")[:96]
+                    if direction not in {"add", "remove"}:
+                        await reject_action(user_id, "Choose whether the cabinet adds or removes chips.")
+                        continue
+                    if (
+                        not math.isfinite(amount)
+                        or amount != math.floor(amount)
+                        or not PIT_BOSS_MIN_GRANT <= amount <= PIT_BOSS_MAX_GRANT
+                    ):
+                        await reject_action(
+                            user_id,
+                            f"Ledger adjustments must be whole amounts from {PIT_BOSS_MIN_GRANT:.0f} to {PIT_BOSS_MAX_GRANT:.0f} ◉.",
+                        )
+                        continue
+                    if len(note.strip()) < 3:
+                        await reject_action(user_id, "Write a short reason before changing a persistent chip balance.")
+                        continue
+                    if not await claim_action_slot(user_id, "pit_boss_adjust", PIT_BOSS_GRANT_COOLDOWN_SECONDS):
+                        await reject_action(user_id, "The ledger clerk is still stamping the last adjustment. One moment.")
+                        continue
+                    signed_amount = amount if direction == "add" else -amount
+                    try:
+                        updated_balance = await change_balance(
+                            str(target_id),
+                            signed_amount,
+                            f"pit_boss_{'credit' if direction == 'add' else 'debit'}",
+                            actor_id=user_id,
+                            metadata={"note": note},
+                        )
+                    except ValueError:
+                        await reject_action(user_id, "The cabinet will not take a player below zero virtual chips.")
+                        continue
+                    await manager.send_state(
+                        str(target_id),
+                        "pit_boss_adjusted",
+                        adjustment_amount=signed_amount,
+                        adjustment_reason=note,
+                    )
+                    dashboard = await pit_boss_dashboard_payload(target_ref)
+                    await manager.send_state(
+                        user_id,
+                        "pit_boss_adjusted",
+                        adjustment_amount=signed_amount,
+                        adjustment_reason=note,
+                        adjustment_balance=updated_balance,
+                        pit_boss_dashboard=dashboard,
+                    )
+                    await manager.broadcast_leaderboard()
+
+                elif action == "force_start":
                     await reject_action(
                         user_id,
-                        f"Ledger adjustments must be whole amounts from {PIT_BOSS_MIN_GRANT:.0f} to {PIT_BOSS_MAX_GRANT:.0f} ◉.",
+                        "The cabinet lights only when every victim holds LIGHT IT UP, the lobby fills, or three victims wait 45 seconds.",
                     )
-                    continue
-                if len(note.strip()) < 3:
-                    await reject_action(user_id, "Write a short reason before changing a persistent chip balance.")
-                    continue
-                if not await claim_action_slot(user_id, "pit_boss_adjust", PIT_BOSS_GRANT_COOLDOWN_SECONDS):
-                    await reject_action(user_id, "The ledger clerk is still stamping the last adjustment. One moment.")
-                    continue
-                signed_amount = amount if direction == "add" else -amount
-                try:
-                    updated_balance = await change_balance(
-                        str(target_id),
-                        signed_amount,
-                        f"pit_boss_{'credit' if direction == 'add' else 'debit'}",
-                        actor_id=user_id,
-                        metadata={"note": note},
-                    )
-                except ValueError:
-                    await reject_action(user_id, "The cabinet will not take a player below zero virtual chips.")
-                    continue
-                await manager.send_state(
-                    str(target_id),
-                    "pit_boss_adjusted",
-                    adjustment_amount=signed_amount,
-                    adjustment_reason=note,
-                )
-                dashboard = await pit_boss_dashboard_payload(target_ref)
-                await manager.send_state(
-                    user_id,
-                    "pit_boss_adjusted",
-                    adjustment_amount=signed_amount,
-                    adjustment_reason=note,
-                    adjustment_balance=updated_balance,
-                    pit_boss_dashboard=dashboard,
-                )
-                await manager.broadcast_leaderboard()
 
-            elif action == "force_start":
-                await reject_action(
-                    user_id,
-                    "The cabinet lights only when every victim holds LIGHT IT UP, the lobby fills, or three victims wait 45 seconds.",
-                )
+                elif action == "pass" and game_state["phase"] == "running":
+                    if game_state["current_holder"] == user_id:
+                        balance = await get_balance(user_id)
+                        if balance >= PASS_FEE:
+                            if not await claim_action_slot(
+                                user_id, "pass", PASS_COOLDOWN_SECONDS
+                            ):
+                                continue
+                            await change_balance(
+                                user_id,
+                                -PASS_FEE,
+                                "pass_fee",
+                                round_ref=game_state["round_number"],
+                            )
+                            await update_player_profile(user_id, passes=1)
+                            game_state["pot"] += PASS_FEE
 
-            elif action == "pass" and game_state["phase"] == "running":
-                if game_state["current_holder"] == user_id:
-                    balance = await get_balance(user_id)
-                    if balance >= PASS_FEE:
-                        if not await claim_action_slot(
-                            user_id, "pass", PASS_COOLDOWN_SECONDS
-                        ):
-                            continue
-                        await change_balance(
-                            user_id,
-                            -PASS_FEE,
-                            "pass_fee",
-                            round_ref=game_state["round_number"],
-                        )
-                        await update_player_profile(user_id, passes=1)
-                        game_state["pot"] += PASS_FEE
+                            current_index = next(
+                                (
+                                    index
+                                    for index, player in enumerate(game_state["players"])
+                                    if player["id"] == user_id
+                                ),
+                                0,
+                            )
+                            next_index = (current_index + 1) % len(game_state["players"])
+                            game_state["current_holder"] = game_state["players"][next_index]["id"]
 
-                        current_index = next(
-                            (
-                                index
-                                for index, player in enumerate(game_state["players"])
-                                if player["id"] == user_id
-                            ),
-                            0,
-                        )
-                        next_index = (current_index + 1) % len(game_state["players"])
-                        game_state["current_holder"] = game_state["players"][next_index]["id"]
-
-                        await manager.broadcast_state("update")
+                            await manager.broadcast_state("update")
 
     except WebSocketDisconnect:
         manager.disconnect(user_id, websocket)
         if manager.active_connections.get(user_id) is None:
-            await handle_player_disconnect(user_id)
+            async with game_lock:
+                await handle_player_disconnect(user_id)
