@@ -64,6 +64,7 @@ MASTER_RESET_COOLDOWN_SECONDS = 5.0
 MASTER_RESET_PHRASE = "RESET ALL CHIPS"
 DELETE_PLAYER_PHRASE = "ERASE PLAYER RECORD"
 DELETE_PLAYER_COOLDOWN_SECONDS = 5.0
+DELETE_ALL_PLAYERS_PHRASE = "ERASE ALL PLAYER RECORDS"
 SPECTATOR_REACTIONS = {"👀", "🔥", "😱", "💥", "🪦"}
 SPECTATOR_REACTION_COOLDOWN_SECONDS = 1.8
 GHOST_REACTIONS = {"💀", "👻", "🍿"}
@@ -663,6 +664,63 @@ async def delete_player_completely(user_id: str, profile_ref: str, actor_id: str
     await redis_client.lpush(ADMIN_LEDGER_KEY, json.dumps(audit_entry, separators=(",", ":")))
     await redis_client.ltrim(ADMIN_LEDGER_KEY, 0, ADMIN_LEDGER_LIMIT - 1)
     return removed
+
+
+async def delete_all_players_completely(actor_id: str, reason: str) -> dict:
+    """Nuclear option: irreversibly purge every known player's balance, profile, ledger,
+    and live leaderboard/season entries in one pass.
+
+    Unlike delete_player_completely(), this handles the shared ds:admin_ledger and
+    ds:player_profile_refs with one full wipe apiece rather than once per user --
+    filtering the admin ledger per player would turn an already-expensive full
+    rewrite into an O(players x ledger_size) one. Same historical-archive
+    limitation applies: already-closed weekly season snapshots are frozen
+    name/handle strings with no live user_id link and are left untouched.
+    """
+    profile_ids = set((await redis_client.hgetall(PLAYER_PROFILES_KEY)).keys())
+    balance_ids = set((await redis_client.hgetall(BALANCES_KEY)).keys())
+    all_ids = {str(value) for value in (profile_ids | balance_ids)}
+
+    for target_id in all_ids:
+        await redis_client.hdel(BALANCES_KEY, target_id)
+        await redis_client.hdel(PLAYER_PROFILES_KEY, target_id)
+        await redis_client.delete(f"{PLAYER_LEDGER_PREFIX}{target_id}")
+
+    await redis_client.delete(PLAYER_PROFILE_REFS_KEY)
+
+    group_refs: set[str] = set()
+    groups = await redis_client.hgetall(REGISTERED_GROUPS_KEY)
+    for raw_group in groups.values():
+        try:
+            group = json.loads(raw_group)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        group_ref = clean_group_ref(group.get("ref"))
+        if group_ref:
+            group_refs.add(group_ref)
+
+    for group_ref in group_refs:
+        await redis_client.delete(f"{GROUP_COMPETITIVE_PREFIX}{group_ref}")
+        current_week = str(await redis_client.get(f"{GROUP_SEASON_CURRENT_PREFIX}{group_ref}") or "")
+        if current_week:
+            await redis_client.delete(f"{GROUP_SEASON_CURRENT_PREFIX}{group_ref}:{current_week}")
+
+    await redis_client.delete(ADMIN_LEDGER_KEY)
+
+    audit_entry = {
+        "event_id": secrets.token_urlsafe(12),
+        "created_at": int(time.time()),
+        "target_id": "deleted:ALL_PLAYERS",
+        "actor_id": actor_id,
+        "amount": 0.0,
+        "balance_after": 0.0,
+        "reason": "all_player_data_deleted",
+        "round": 0,
+        "metadata": {"note": str(reason)[:96], "players_removed": len(all_ids)},
+    }
+    await redis_client.lpush(ADMIN_LEDGER_KEY, json.dumps(audit_entry, separators=(",", ":")))
+    await redis_client.ltrim(ADMIN_LEDGER_KEY, 0, ADMIN_LEDGER_LIMIT - 1)
+    return {"players_removed": len(all_ids), "groups_cleared": len(group_refs)}
 
 
 async def master_reset_virtual_chips(actor_id: str, reason: str) -> int:
@@ -2693,6 +2751,34 @@ async def websocket_endpoint(
                         user_id,
                         "pit_boss_player_deleted",
                         deleted_ref=target_ref,
+                        removed_summary=removed_summary,
+                        pit_boss_dashboard=dashboard,
+                    )
+                    await manager.broadcast_leaderboard()
+
+                elif action == "pit_boss_delete_all_players":
+                    if user_id not in manager.pit_boss_connections:
+                        await reject_action(user_id, "Only a verified Pit Boss may erase every player's records.")
+                        continue
+                    if game_state["phase"] != "lobby" or game_state["players"]:
+                        await reject_action(user_id, "Erasing every record is locked until the lobby is empty and no fuse is active.")
+                        continue
+                    confirmation = str(data.get("confirmation", "")).strip().upper()
+                    note = clean_profile_name(data.get("reason", ""), "")[:96]
+                    if confirmation != DELETE_ALL_PLAYERS_PHRASE:
+                        await reject_action(user_id, f"Type {DELETE_ALL_PLAYERS_PHRASE} exactly before erasing every player's records.")
+                        continue
+                    if len(note.strip()) < 3:
+                        await reject_action(user_id, "Write a short reason before erasing every player's records.")
+                        continue
+                    if not await claim_action_slot(user_id, "pit_boss_delete_all_players", DELETE_PLAYER_COOLDOWN_SECONDS):
+                        await reject_action(user_id, "The records room is still cooling down. One moment.")
+                        continue
+                    removed_summary = await delete_all_players_completely(user_id, note)
+                    dashboard = await pit_boss_dashboard_payload()
+                    await manager.send_state(
+                        user_id,
+                        "pit_boss_all_players_deleted",
                         removed_summary=removed_summary,
                         pit_boss_dashboard=dashboard,
                     )
