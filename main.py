@@ -62,6 +62,8 @@ PIT_BOSS_MAX_GRANT = 10000.0
 PIT_BOSS_GRANT_COOLDOWN_SECONDS = 1.0
 MASTER_RESET_COOLDOWN_SECONDS = 5.0
 MASTER_RESET_PHRASE = "RESET ALL CHIPS"
+DELETE_PLAYER_PHRASE = "ERASE PLAYER RECORD"
+DELETE_PLAYER_COOLDOWN_SECONDS = 5.0
 SPECTATOR_REACTIONS = {"👀", "🔥", "😱", "💥", "🪦"}
 SPECTATOR_REACTION_COOLDOWN_SECONDS = 1.8
 GHOST_REACTIONS = {"💀", "👻", "🍿"}
@@ -588,6 +590,79 @@ async def change_balance(
         round_ref=round_ref,
         metadata=metadata,
     )
+
+
+async def delete_player_completely(user_id: str, profile_ref: str, actor_id: str, reason: str) -> dict:
+    """Irreversibly purge a player's balance, profile, personal ledger, and live leaderboard/season entries.
+
+    Deliberately does NOT rewrite already-archived historical season snapshots:
+    archive_group_season() freezes each week's results as a plain name/handle
+    string with no live user_id link (see ranked_season_rows), so there is
+    nothing to unlink there -- and rewriting a closed week's recorded winner
+    would mean editing a historical fact, which is a separate, more invasive
+    decision this function does not make silently.
+    """
+    removed = {"admin_ledger_entries_purged": 0, "group_competitive_removed": 0, "group_season_removed": 0}
+
+    # Strip this user's own entries out of the shared admin audit ledger.
+    # Their per-player ledger list is deleted outright below instead of filtered.
+    admin_entries = await redis_client.lrange(ADMIN_LEDGER_KEY, 0, -1)
+    kept: list[str] = []
+    for raw in admin_entries:
+        try:
+            entry = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            kept.append(raw)
+            continue
+        if str(entry.get("target_id")) == str(user_id):
+            removed["admin_ledger_entries_purged"] += 1
+            continue
+        kept.append(raw)
+    if removed["admin_ledger_entries_purged"]:
+        await redis_client.delete(ADMIN_LEDGER_KEY)
+        if kept:
+            await redis_client.rpush(ADMIN_LEDGER_KEY, *kept)
+            await redis_client.ltrim(ADMIN_LEDGER_KEY, 0, ADMIN_LEDGER_LIMIT - 1)
+
+    await redis_client.hdel(BALANCES_KEY, user_id)
+    await redis_client.hdel(PLAYER_PROFILES_KEY, user_id)
+    if profile_ref:
+        await redis_client.hdel(PLAYER_PROFILE_REFS_KEY, profile_ref)
+    await redis_client.delete(f"{PLAYER_LEDGER_PREFIX}{user_id}")
+
+    # Strip from every registered group's live competitive board and the
+    # current (still-mutable) season week only -- see docstring re: archives.
+    groups = await redis_client.hgetall(REGISTERED_GROUPS_KEY)
+    for raw_group in groups.values():
+        try:
+            group = json.loads(raw_group)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        group_ref = clean_group_ref(group.get("ref"))
+        if not group_ref:
+            continue
+        if await redis_client.hdel(f"{GROUP_COMPETITIVE_PREFIX}{group_ref}", user_id):
+            removed["group_competitive_removed"] += 1
+        current_week = str(await redis_client.get(f"{GROUP_SEASON_CURRENT_PREFIX}{group_ref}") or "")
+        if current_week and await redis_client.hdel(f"{GROUP_SEASON_CURRENT_PREFIX}{group_ref}:{current_week}", user_id):
+            removed["group_season_removed"] += 1
+
+    # Log the deletion itself using the profile ref, not the raw Telegram user
+    # ID -- which no longer exists anywhere in Redis after the lines above.
+    audit_entry = {
+        "event_id": secrets.token_urlsafe(12),
+        "created_at": int(time.time()),
+        "target_id": f"deleted:{profile_ref or 'unknown'}",
+        "actor_id": actor_id,
+        "amount": 0.0,
+        "balance_after": 0.0,
+        "reason": "player_data_deleted",
+        "round": 0,
+        "metadata": {"note": str(reason)[:96]},
+    }
+    await redis_client.lpush(ADMIN_LEDGER_KEY, json.dumps(audit_entry, separators=(",", ":")))
+    await redis_client.ltrim(ADMIN_LEDGER_KEY, 0, ADMIN_LEDGER_LIMIT - 1)
+    return removed
 
 
 async def master_reset_virtual_chips(actor_id: str, reason: str) -> int:
@@ -2588,6 +2663,37 @@ async def websocket_endpoint(
                         adjustment_amount=signed_amount,
                         adjustment_reason=note,
                         adjustment_balance=updated_balance,
+                        pit_boss_dashboard=dashboard,
+                    )
+                    await manager.broadcast_leaderboard()
+
+                elif action == "pit_boss_delete_player":
+                    if user_id not in manager.pit_boss_connections:
+                        await reject_action(user_id, "Only a verified Pit Boss may erase a player's records.")
+                        continue
+                    target_ref = str(data.get("target_ref", ""))[:32]
+                    target_id = await redis_client.hget(PLAYER_PROFILE_REFS_KEY, target_ref)
+                    if not target_id:
+                        await reject_action(user_id, "Choose a known player profile before erasing it.")
+                        continue
+                    confirmation = str(data.get("confirmation", "")).strip().upper()
+                    note = clean_profile_name(data.get("reason", ""), "")[:96]
+                    if confirmation != DELETE_PLAYER_PHRASE:
+                        await reject_action(user_id, f"Type {DELETE_PLAYER_PHRASE} exactly before erasing a player's records.")
+                        continue
+                    if len(note.strip()) < 3:
+                        await reject_action(user_id, "Write a short reason before erasing a player's records.")
+                        continue
+                    if not await claim_action_slot(user_id, "pit_boss_delete_player", DELETE_PLAYER_COOLDOWN_SECONDS):
+                        await reject_action(user_id, "The records room is still cooling down. One moment.")
+                        continue
+                    removed_summary = await delete_player_completely(str(target_id), target_ref, user_id, note)
+                    dashboard = await pit_boss_dashboard_payload()
+                    await manager.send_state(
+                        user_id,
+                        "pit_boss_player_deleted",
+                        deleted_ref=target_ref,
+                        removed_summary=removed_summary,
                         pit_boss_dashboard=dashboard,
                     )
                     await manager.broadcast_leaderboard()
