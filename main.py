@@ -64,6 +64,28 @@ MASTER_RESET_COOLDOWN_SECONDS = 5.0
 MASTER_RESET_PHRASE = "RESET ALL CHIPS"
 SPECTATOR_REACTIONS = {"👀", "🔥", "😱", "💥", "🪦"}
 SPECTATOR_REACTION_COOLDOWN_SECONDS = 1.8
+GHOST_REACTIONS = {"💀", "👻", "🍿"}
+TAUNT_LINES = [
+    "🔥 the pot doesn't want you to make it",
+    "👀 everyone's watching your hands shake",
+    "⏳ tick tock, whoever's holding it",
+    "🎯 statistically, someone's due",
+    "🍿 this is the good part",
+]
+TAUNT_COOLDOWN_SECONDS = 3.0
+# Populate with real sticker file_ids once a custom pack exists (via @Stickers +
+# BotFather); until then this stays empty and reactions are emoji-only in chat.
+# Format: {"💥": "CAACAgEAAxkBAAI...", ...} -- keys must be a subset of
+# SPECTATOR_REACTIONS or GHOST_REACTIONS.
+try:
+    SPECTATOR_STICKER_FILE_IDS: dict[str, str] = json.loads(os.getenv("SPECTATOR_STICKER_FILE_IDS", "{}"))
+except (TypeError, ValueError, json.JSONDecodeError):
+    SPECTATOR_STICKER_FILE_IDS = {}
+SPECTATOR_STICKER_POST_COOLDOWN_SECONDS = 10.0
+NUDGE_COOLDOWN_SECONDS = 60.0
+RECORD_BIGGEST_POT_PREFIX = "ds:record_biggest_pot:"
+REIGNING_CHAMPION_PREFIX = "ds:reigning_champion:"
+DEFAULT_GROUP_REF_KEY = "default"
 PIT_BOSS_IDS = {
     value.strip()
     for value in os.getenv("PIT_BOSS_USER_IDS", "").split(",")
@@ -97,6 +119,7 @@ game_state = {
     "latest_round": None,
     "ready_players": [],
     "lobby_auto_start_at": 0.0,
+    "predictions": {},
 }
 reset_task = None
 intermission_task = None
@@ -735,6 +758,58 @@ async def touch_registered_group(group_ref: str, field: str) -> None:
         return
 
 
+async def chat_id_for_group_ref(group_ref: str) -> str | None:
+    """Resolve a registered group's chat_id from its opaque public ref, for server-initiated posts."""
+    safe_ref = clean_group_ref(group_ref)
+    if not safe_ref:
+        return None
+    groups = await redis_client.hgetall(REGISTERED_GROUPS_KEY)
+    for chat_id, raw in groups.items():
+        try:
+            group = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if str(group.get("ref")) == safe_ref:
+            return chat_id
+    return None
+
+
+async def set_reigning_champion(group_ref: str, survivor: dict) -> None:
+    """Persist the most recent survivor so the next lobby card can show a champion tag."""
+    payload = json.dumps(
+        {"name": clean_profile_name(survivor.get("name")), "public_handle": clean_public_handle(survivor.get("public_handle"))},
+        separators=(",", ":"),
+    )
+    await redis_client.set(f"{REIGNING_CHAMPION_PREFIX}{group_ref or DEFAULT_GROUP_REF_KEY}", payload)
+
+
+async def reigning_champion_label(group_ref: str) -> str | None:
+    """Return the display label for the current reigning champion of a group, if any."""
+    raw = await redis_client.get(f"{REIGNING_CHAMPION_PREFIX}{group_ref or DEFAULT_GROUP_REF_KEY}")
+    if not raw:
+        return None
+    try:
+        champion = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    handle = clean_public_handle(champion.get("public_handle"))
+    return f"@{handle}" if handle else escape(clean_profile_name(champion.get("name")))
+
+
+async def check_and_record_biggest_pot(group_ref: str, payout: float) -> bool:
+    """Update the group's biggest-pot record; return True only if this payout set a new record."""
+    key = f"{RECORD_BIGGEST_POT_PREFIX}{group_ref or DEFAULT_GROUP_REF_KEY}"
+    current = await redis_client.get(key)
+    try:
+        current_value = float(current) if current is not None else 0.0
+    except (TypeError, ValueError):
+        current_value = 0.0
+    if payout <= current_value:
+        return False
+    await redis_client.set(key, str(payout))
+    return True
+
+
 async def registered_group_for_chat(chat_id: str) -> dict | None:
     """Resolve a Telegram group only inside the trusted webhook boundary."""
     safe_chat_id = str(chat_id or "")
@@ -1138,9 +1213,18 @@ class ConnectionManager:
         for user_id in list(self.active_connections):
             await self.send_state(user_id, "leaderboard_refresh")
 
-    async def broadcast_spectator_reaction(self, reaction: str) -> None:
+    async def broadcast_spectator_reaction(self, reaction: str, is_ghost: bool = False) -> None:
         """Deliver one anonymous, non-gameplay spectator reaction without sending profile data."""
-        payload = {"type": "spectator_reaction", "reaction": reaction}
+        payload = {"type": "spectator_reaction", "reaction": reaction, "ghost": is_ghost}
+        for connection in list(self.active_connections.values()):
+            try:
+                await connection.send_json(payload)
+            except Exception:
+                pass
+
+    async def broadcast_taunt(self, taunt_text: str) -> None:
+        """Deliver one anonymous taunt line aimed at whoever's holding the bomb."""
+        payload = {"type": "taunt", "text": taunt_text}
         for connection in list(self.active_connections.values()):
             try:
                 await connection.send_json(payload)
@@ -1186,7 +1270,7 @@ def generate_crash():
     return seed, hashed, round(crash, 2)
 
 
-def current_lobby_card(group_ref: str = "") -> dict:
+async def current_lobby_card(group_ref: str = "") -> dict:
     """Build the public, visual announcement Telegram inserts into a selected chat."""
     players = game_state["players"]
     ready_players = {str(user_id) for user_id in game_state.get("ready_players", [])}
@@ -1234,9 +1318,22 @@ def current_lobby_card(group_ref: str = "") -> dict:
             "url": f"https://t.me/{BOT_USERNAME}?startapp={watch_param}",
         }
     )
+    keyboard_rows = [[button]]
+    # Nudge/leaderboard-drop only make sense for a registered group card, since
+    # we need a known chat_id to post a *new* message into -- the anonymous
+    # inline-shared card has no chat_id the bot can address directly.
+    if safe_group_ref:
+        second_row = []
+        if phase == "lobby":
+            second_row.append({"text": "📣 NUDGE THE GROUP", "callback_data": f"nudge:{safe_group_ref}"})
+        second_row.append({"text": "🏆 LEADERBOARD", "callback_data": f"leaderboard_drop:{safe_group_ref}"})
+        keyboard_rows.append(second_row)
+    champion_label = await reigning_champion_label(safe_group_ref) if safe_group_ref else None
+    champion_line = f"🏆 <b>Reigning champion:</b> {champion_label}\n\n" if champion_label else ""
     text = (
         "💣 <b>DON'T SPLODE</b> 💣\n"
         "━━━━━━━━━━━━\n\n"
+        f"{champion_line}"
         f"<b>{heading}</b>\n\n"
         "Buy-in: <b>100 ◉</b>\n"
         "Pass fee: <b>5 ◉</b> (bled into the pot)\n\n"
@@ -1255,11 +1352,7 @@ def current_lobby_card(group_ref: str = "") -> dict:
         "thumbnail_url": f"{PUBLIC_BACKEND_URL}/telegram/posters/lobby.png",
         "caption": text,
         "parse_mode": "HTML",
-        "reply_markup": {
-            "inline_keyboard": [
-                [button]
-            ]
-        },
+        "reply_markup": {"inline_keyboard": keyboard_rows},
     }
 
 
@@ -1275,6 +1368,14 @@ def current_round_result_card(payout: float, survivors: list[dict], group_ref: s
     survivor_count = len(survivors)
     survivor_label = "SOUL" if survivor_count == 1 else "SOULS"
     remaining_players = public_remaining_players_caption(survivors)
+    predictions = game_state.get("predictions") or {}
+    prediction_line = ""
+    if predictions and survivors:
+        winner_id = str(survivors[0]["id"])
+        correct = sum(1 for guess in predictions.values() if str(guess) == winner_id)
+        if correct:
+            caller_label = "caller" if correct == 1 else "callers"
+            prediction_line = f"🔮 <b>{correct}</b> {caller_label} saw it coming.\n\n"
     text = (
         "💥 <b>DON'T SPLODE — ROUND RESULT</b> 💥\n"
         "━━━━━━━━━━━━\n\n"
@@ -1282,20 +1383,24 @@ def current_round_result_card(payout: float, survivors: list[dict], group_ref: s
         f"Crash: <b>{multiplier:.2f}×</b>\n"
         f"Last standing: <b>{survivor_count} {survivor_label}</b> — <b>{remaining_players}</b>\n"
         f"Final pot: <b>{payout:.2f} ◉</b>\n\n"
+        f"{prediction_line}"
         "<i>The cabinet swept up the ash. The next lobby needs fresh volunteers.</i>"
     )
     safe_group_ref = clean_group_ref(group_ref)
     start_param = f"watch_{safe_group_ref}" if safe_group_ref else "watch"
-    markup = {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "VIEW THE CABINET RECORD",
-                    "url": f"https://t.me/{BOT_USERNAME}?startapp={start_param}",
-                }
-            ]
+    keyboard_rows = [
+        [
+            {
+                "text": "VIEW THE CABINET RECORD",
+                "url": f"https://t.me/{BOT_USERNAME}?startapp={start_param}",
+            }
         ]
-    }
+    ]
+    # A rematch button needs a known chat_id to post the fresh lobby card into,
+    # which only exists for a registered group -- not the anonymous inline card.
+    if safe_group_ref:
+        keyboard_rows.append([{"text": "🔁 REMATCH", "callback_data": f"rematch:{safe_group_ref}"}])
+    markup = {"inline_keyboard": keyboard_rows}
     return text, markup
 
 
@@ -1461,7 +1566,7 @@ async def send_registered_group_lobby_card(group: dict) -> bool:
     chat_id = str(group.get("chat_id", ""))
     if not chat_id:
         return False
-    card = current_lobby_card(clean_group_ref(group.get("ref")))
+    card = await current_lobby_card(clean_group_ref(group.get("ref")))
     ok, result = await telegram_api_call(
         "sendPhoto",
         {
@@ -1498,7 +1603,7 @@ async def active_group_cards() -> list[tuple[str, dict]]:
 async def refresh_lobby_cards() -> None:
     """Update every tracked lobby card from public authoritative game state."""
     card_ids = await redis_client.smembers(ACTIVE_LOBBY_CARDS_KEY)
-    card = current_lobby_card()
+    card = await current_lobby_card()
     text = card["caption"]
     markup = card["reply_markup"]
     outcomes = await asyncio.gather(*(edit_inline_caption(card_id, text, markup) for card_id in card_ids)) if card_ids else []
@@ -1507,15 +1612,13 @@ async def refresh_lobby_cards() -> None:
         print(f"Removing {len(stale_ids)} stale Telegram inline card(s)")
         await redis_client.srem(ACTIVE_LOBBY_CARDS_KEY, *stale_ids)
     group_cards = await active_group_cards()
+    group_card_content = await asyncio.gather(
+        *(current_lobby_card(record.get("group_ref", "")) for _, record in group_cards)
+    ) if group_cards else []
     group_outcomes = await asyncio.gather(
         *(
-            edit_group_caption(
-                record["chat_id"],
-                record["message_id"],
-                current_lobby_card(record.get("group_ref", ""))["caption"],
-                current_lobby_card(record.get("group_ref", ""))["reply_markup"],
-            )
-            for _, record in group_cards
+            edit_group_caption(record["chat_id"], record["message_id"], content["caption"], content["reply_markup"])
+            for (_, record), content in zip(group_cards, group_card_content)
         )
     ) if group_cards else []
     stale_group_keys = [card_key for (card_key, _), ok in zip(group_cards, group_outcomes) if not ok]
@@ -1642,7 +1745,7 @@ async def telegram_webhook(
         return {
             "method": "answerInlineQuery",
             "inline_query_id": inline_query["id"],
-            "results": [current_lobby_card()],
+            "results": [await current_lobby_card()],
             "cache_time": 0,
             "is_personal": False,
         }
@@ -1665,6 +1768,65 @@ async def telegram_webhook(
             "text": "The fuse is lit. Late entries are incinerated.",
             "show_alert": False,
         }
+
+    callback_data = str(callback_query.get("data", ""))
+    callback_message = callback_query.get("message") or {}
+    callback_chat_id = str((callback_message.get("chat") or {}).get("id", ""))
+
+    async def answer_callback(text: str, show_alert: bool = False) -> None:
+        await telegram_api_call(
+            "answerCallbackQuery",
+            {"callback_query_id": callback_query["id"], "text": text, "show_alert": show_alert},
+        )
+
+    async def resolve_callback_group() -> dict | None:
+        """Only trust a callback's embedded group_ref if it matches the chat it actually came from."""
+        target_ref = clean_group_ref(callback_data.split(":", 1)[1]) if ":" in callback_data else ""
+        group = await registered_group_for_chat(callback_chat_id) if callback_chat_id else None
+        if not group or not target_ref or clean_group_ref(group.get("ref")) != target_ref:
+            return None
+        return group
+
+    if callback_data.startswith("rematch:"):
+        group = await resolve_callback_group()
+        if not group:
+            await answer_callback("This cabinet isn't registered anymore.", show_alert=True)
+            return {"ok": True}
+        if game_state["phase"] != "lobby" or game_state["players"]:
+            await answer_callback("A round's already brewing. Wait for it to clear.", show_alert=True)
+            return {"ok": True}
+        sent = await send_registered_group_lobby_card(group)
+        await answer_callback("Fresh lobby posted." if sent else "Telegram refused the new card. Try again.")
+        return {"ok": True}
+
+    if callback_data.startswith("leaderboard_drop:"):
+        group = await resolve_callback_group()
+        if not group:
+            await answer_callback("This cabinet isn't registered anymore.", show_alert=True)
+            return {"ok": True}
+        await telegram_api_call(
+            "sendMessage",
+            {"chat_id": callback_chat_id, "text": await group_leaderboard_message(group), "parse_mode": "HTML"},
+        )
+        await answer_callback("Standings posted.")
+        return {"ok": True}
+
+    if callback_data.startswith("nudge:"):
+        group = await resolve_callback_group()
+        if not group:
+            await answer_callback("This cabinet isn't registered anymore.", show_alert=True)
+            return {"ok": True}
+        if game_state["phase"] != "lobby":
+            await answer_callback("The lobby's already sealed.", show_alert=True)
+            return {"ok": True}
+        if not await claim_action_slot(f"group:{clean_group_ref(group.get('ref'))}", "nudge", NUDGE_COOLDOWN_SECONDS):
+            await answer_callback("Already nudged recently. Give it a minute.", show_alert=True)
+            return {"ok": True}
+        needed = max(0, MINIMUM_COUNTDOWN_PLAYERS - len(game_state["players"]))
+        nudge_text = f"📣 Need {needed} more to light this!" if needed else "📣 Enough to light — someone hold LIGHT IT UP!"
+        await telegram_api_call("sendMessage", {"chat_id": callback_chat_id, "text": nudge_text})
+        await answer_callback("Nudge sent.")
+        return {"ok": True}
 
     message = update.get("message") or {}
     chat = message.get("chat") or {}
@@ -1729,6 +1891,7 @@ def reset_round_state():
             "round_number": 0,
             "ready_players": [],
             "lobby_auto_start_at": 0.0,
+            "predictions": {},
         }
     )
 
@@ -1899,6 +2062,22 @@ async def detonate():
         # Retain only public-safe match statistics after the lobby reopens.
         for group_ref, participant_ids in list(round_group_rosters.items()):
             await record_group_match_results(group_ref, participant_ids, survivors[0]["id"] if survivors else "", payout)
+            if survivors:
+                await set_reigning_champion(group_ref, survivors[0])
+                if await check_and_record_biggest_pot(group_ref, payout):
+                    record_chat_id = await chat_id_for_group_ref(group_ref)
+                    if record_chat_id:
+                        await telegram_api_call(
+                            "sendMessage",
+                            {
+                                "chat_id": record_chat_id,
+                                "text": (
+                                    "🏆 <b>NEW CABINET RECORD</b> 🏆\n"
+                                    f"Biggest pot ever won: <b>{payout:.2f} ◉</b>"
+                                ),
+                                "parse_mode": "HTML",
+                            },
+                        )
         game_state["phase"] = "ended"
         game_state["latest_round"] = {
             "multiplier": round(game_state["multiplier"], 2),
@@ -1919,6 +2098,21 @@ async def detonate():
         return
 
     game_state["phase"] = "intermission"
+    if len(game_state["eliminated_players"]) == 1:
+        # First elimination of this round -- fire a one-off "First Blood" post
+        # into every involved group's chat, separate from the card that gets
+        # edited in place for every subsequent elimination.
+        for group_ref in list(round_group_rosters):
+            fb_chat_id = await chat_id_for_group_ref(group_ref)
+            if fb_chat_id and loser:
+                await telegram_api_call(
+                    "sendMessage",
+                    {
+                        "chat_id": fb_chat_id,
+                        "text": f"🩸 <b>FIRST BLOOD.</b> {escape(public_player_label(loser))} didn't even make it to the second pass.",
+                        "parse_mode": "HTML",
+                    },
+                )
     await publish_elimination_poster(loser, survivors)
     await manager.broadcast_state(
         "eliminated",
@@ -1983,6 +2177,18 @@ async def handle_player_disconnect(user_id: str) -> None:
         await update_player_profile(survivors[0]["id"], matches_survived=1, total_pot_won=payout)
         for group_ref, participant_ids in list(round_group_rosters.items()):
             await record_group_match_results(group_ref, participant_ids, survivors[0]["id"], payout)
+            await set_reigning_champion(group_ref, survivors[0])
+            if await check_and_record_biggest_pot(group_ref, payout):
+                record_chat_id = await chat_id_for_group_ref(group_ref)
+                if record_chat_id:
+                    await telegram_api_call(
+                        "sendMessage",
+                        {
+                            "chat_id": record_chat_id,
+                            "text": f"🏆 <b>NEW CABINET RECORD</b> 🏆\nBiggest pot ever won: <b>{payout:.2f} ◉</b>",
+                            "parse_mode": "HTML",
+                        },
+                    )
         game_state["phase"] = "ended"
         game_state["current_holder"] = None
         game_state["latest_round"] = {
@@ -2082,6 +2288,34 @@ async def websocket_endpoint(
                         await refresh_lobby_cards()
                         await manager.broadcast_state("update")
 
+                elif action == "leave_lobby":
+                    if game_state["phase"] != "lobby":
+                        await reject_action(user_id, "The waiver is binding once the fuse is lit. Ride this one out.")
+                        continue
+                    if not any(player["id"] == user_id for player in game_state["players"]):
+                        await reject_action(user_id, "You never signed the waiver, so there's nothing to tear up.")
+                        continue
+
+                    game_state["players"] = [p for p in game_state["players"] if p["id"] != user_id]
+                    ready_players = {str(pid) for pid in game_state.get("ready_players", [])}
+                    ready_players.discard(user_id)
+                    game_state["ready_players"] = sorted(ready_players)
+                    game_state["pot"] = max(0.0, game_state["pot"] - JOIN_COST)
+                    if signed_group_ref and signed_group_ref in round_group_rosters:
+                        round_group_rosters[signed_group_ref].discard(user_id)
+                    await change_balance(
+                        user_id,
+                        JOIN_COST,
+                        "leave_lobby_refund",
+                        round_ref=game_state["round_number"],
+                    )
+                    # Below the countdown threshold, cancel the pending auto-ignition --
+                    # same rule join() uses in reverse.
+                    if len(game_state["players"]) < MINIMUM_COUNTDOWN_PLAYERS:
+                        game_state["lobby_auto_start_at"] = 0.0
+                    await refresh_lobby_cards()
+                    await manager.broadcast_state("update")
+
                 elif action == "light_it_up":
                     if game_state["phase"] != "lobby":
                         await reject_action(user_id, "The fuse is already lit. Keep your hands off the matchbook.")
@@ -2148,20 +2382,62 @@ async def websocket_endpoint(
                     )
 
                 elif action == "spectator_reaction":
-                    if not manager.spectator_contexts.get(user_id):
+                    is_ghost = any(str(p["id"]) == user_id for p in game_state["eliminated_players"])
+                    is_spectator = bool(manager.spectator_contexts.get(user_id))
+                    if not is_ghost and not is_spectator:
                         await reject_action(user_id, "Only watch-only cabinet visitors may trigger the reaction rail.")
                         continue
                     if game_state["phase"] not in {"running", "intermission"}:
                         await reject_action(user_id, "The reaction rail wakes only while the fuse is live or the ash is settling.")
                         continue
                     reaction = str(data.get("reaction", ""))
-                    if reaction not in SPECTATOR_REACTIONS:
+                    allowed_reactions = GHOST_REACTIONS if is_ghost else SPECTATOR_REACTIONS
+                    if reaction not in allowed_reactions:
                         await reject_action(user_id, "That reaction is not mounted on this cabinet.")
                         continue
                     if not await claim_action_slot(user_id, "spectator_reaction", SPECTATOR_REACTION_COOLDOWN_SECONDS):
                         await reject_action(user_id, "The reaction rail needs a moment before another outburst.")
                         continue
-                    await manager.broadcast_spectator_reaction(reaction)
+                    await manager.broadcast_spectator_reaction(reaction, is_ghost=is_ghost)
+                    sticker_file_id = SPECTATOR_STICKER_FILE_IDS.get(reaction)
+                    if sticker_file_id and signed_group_ref:
+                        if await claim_action_slot(f"group:{signed_group_ref}", "sticker_post", SPECTATOR_STICKER_POST_COOLDOWN_SECONDS):
+                            sticker_chat_id = await chat_id_for_group_ref(signed_group_ref)
+                            if sticker_chat_id:
+                                await telegram_api_call("sendSticker", {"chat_id": sticker_chat_id, "sticker": sticker_file_id})
+
+                elif action == "taunt":
+                    is_ghost = any(str(p["id"]) == user_id for p in game_state["eliminated_players"])
+                    is_spectator = bool(manager.spectator_contexts.get(user_id))
+                    if not is_ghost and not is_spectator:
+                        await reject_action(user_id, "Only watch-only cabinet visitors may taunt the current holder.")
+                        continue
+                    if game_state["phase"] != "running":
+                        await reject_action(user_id, "There's nobody sweating to taunt right now.")
+                        continue
+                    try:
+                        taunt_index = int(data.get("taunt_id"))
+                    except (TypeError, ValueError):
+                        await reject_action(user_id, "Pick an actual taunt off the list.")
+                        continue
+                    if not 0 <= taunt_index < len(TAUNT_LINES):
+                        await reject_action(user_id, "That taunt doesn't exist. Yet.")
+                        continue
+                    if not await claim_action_slot(user_id, "taunt", TAUNT_COOLDOWN_SECONDS):
+                        await reject_action(user_id, "Let the last taunt land before firing another.")
+                        continue
+                    await manager.broadcast_taunt(TAUNT_LINES[taunt_index])
+
+                elif action == "predict_survivor":
+                    if game_state["phase"] != "lobby":
+                        await reject_action(user_id, "Predictions lock the moment the fuse lights. Too slow.")
+                        continue
+                    predicted_id = str(data.get("predicted_player_id", ""))
+                    if not any(str(p["id"]) == predicted_id for p in game_state["players"]):
+                        await reject_action(user_id, "Pick someone who's actually signed the waiver.")
+                        continue
+                    game_state.setdefault("predictions", {})[user_id] = predicted_id
+                    await manager.send_state(user_id, "prediction_locked", predicted_player_id=predicted_id)
 
                 elif action == "pit_boss_master_reset":
                     if user_id not in manager.pit_boss_connections:
