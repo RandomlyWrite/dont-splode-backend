@@ -215,7 +215,7 @@ async def run_checks() -> None:
     assert "balance" not in caption.lower()
     final_caption, _ = main.current_round_result_card(415.0, poster_survivors[:1])
     assert "@fusefriend" in final_caption
-    lobby_card = main.current_lobby_card()
+    lobby_card = await main.current_lobby_card()
     assert lobby_card["type"] == "photo"
     assert lobby_card["photo_url"].endswith("/telegram/posters/lobby.png")
 
@@ -403,6 +403,21 @@ async def run_checks() -> None:
         assert main.game_state["ready_players"] == []
         assert main.game_state["lobby_auto_start_at"] == 0.0
         print("Reset guard: lobby readiness and auto-ignite countdown do not leak into the next match.")
+
+        # leave_lobby, predict_survivor, and taunt are implemented as inline
+        # elif branches inside the websocket dispatch loop rather than standalone
+        # functions (unlike detonate/handle_player_disconnect), so their actual
+        # logic can't be exercised here without either refactoring live dispatch
+        # code or building full WebSocket-level test scaffolding. Neither is done
+        # blind in this pass. What's cheap and worth checking is the data those
+        # branches depend on -- a typo emptying one of these sets would silently
+        # break every reaction/taunt in production with no test catching it.
+        assert main.SPECTATOR_REACTIONS and all(isinstance(r, str) for r in main.SPECTATOR_REACTIONS)
+        assert main.GHOST_REACTIONS and all(isinstance(r, str) for r in main.GHOST_REACTIONS)
+        assert main.TAUNT_LINES and all(isinstance(line, str) and line.strip() for line in main.TAUNT_LINES)
+        assert main.DELETE_PLAYER_PHRASE != main.DELETE_ALL_PLAYERS_PHRASE, "single vs bulk delete confirm phrases must differ to prevent mistyping one for the other"
+        assert main.DELETE_PLAYER_PHRASE != main.MASTER_RESET_PHRASE
+        print("Constant guard: reaction/taunt pools are non-empty and destructive confirm phrases are distinct.")
     finally:
         main.tick_bomb = original_tick_bomb
         main.redis_client = original_ignition_redis
@@ -459,6 +474,33 @@ async def run_checks() -> None:
 
         async def hgetall(self, key):
             return dict(self.hashes.get(key, {}))
+
+        async def hdel(self, key, *fields):
+            bucket = self.hashes.get(key, {})
+            removed = 0
+            for field in fields:
+                if str(field) in bucket:
+                    del bucket[str(field)]
+                    removed += 1
+            return removed
+
+        async def delete(self, *keys):
+            removed = 0
+            for key in keys:
+                if key in self.hashes:
+                    del self.hashes[key]
+                    removed += 1
+                if key in self.lists:
+                    del self.lists[key]
+                    removed += 1
+                if key in self.values:
+                    del self.values[key]
+                    removed += 1
+            return removed
+
+        async def rpush(self, key, *values):
+            self.lists.setdefault(key, []).extend(str(value) for value in values)
+            return len(self.lists[key])
 
         async def get(self, key):
             return self.values.get(key)
@@ -604,8 +646,8 @@ async def run_checks() -> None:
         await spectator_manager.connect(reaction_peer, "reaction-peer")
         assert spectator_manager.spectator_contexts["spectator-user"] is True and spectator_manager.group_contexts["spectator-user"] == group["ref"]
         await spectator_manager.broadcast_spectator_reaction("🔥")
-        assert spectator_socket.sent[-1] == {"type": "spectator_reaction", "reaction": "🔥"}
-        assert reaction_peer.sent[-1] == {"type": "spectator_reaction", "reaction": "🔥"}
+        assert spectator_socket.sent[-1] == {"type": "spectator_reaction", "reaction": "🔥", "ghost": False}
+        assert reaction_peer.sent[-1] == {"type": "spectator_reaction", "reaction": "🔥", "ghost": False}
         assert "spectator-user" not in str(spectator_socket.sent[-1]) and "reaction-peer" not in str(reaction_peer.sent[-1])
         assert "🔥" in main.SPECTATOR_REACTIONS and "not-a-reaction" not in main.SPECTATOR_REACTIONS
         spectator_manager.disconnect("spectator-user", spectator_socket)
@@ -624,7 +666,7 @@ async def run_checks() -> None:
         group_launch_url = native_card_calls[0][1]["reply_markup"]["inline_keyboard"][0][0]["url"]
         assert f"startapp=join_{group['ref']}" in group_launch_url and "-100123" not in group_launch_url
         main.game_state["phase"] = "running"
-        watch_card = main.current_lobby_card(group["ref"])
+        watch_card = await main.current_lobby_card(group["ref"])
         watch_url = watch_card["reply_markup"]["inline_keyboard"][0][0]["url"]
         assert f"startapp=watch_{group['ref']}" in watch_url and "-100123" not in watch_url
         _, elimination_watch_markup = main.current_elimination_card({"name": "QA Loser"}, [{"name": "QA Winner"}], group["ref"])
@@ -643,6 +685,47 @@ async def run_checks() -> None:
         assert alpha_after_reset and alpha_after_reset["matches_survived"] == 3 and alpha_after_reset["total_pot_won"] == 275.0
         reset_events = await ledger_redis.lrange(f"{main.PLAYER_LEDGER_PREFIX}leader-alpha", 0, -1)
         assert any("pit_boss_master_reset" in event and "QA cabinet reset" in event for event in reset_events)
+
+        # --- Single player deletion: leader-gamma has a live profile, balance,
+        # personal ledger, and a group-competitive entry from record_group_match_results
+        # above. Deleting them must not disturb leader-alpha or leader-beta.
+        gamma_ref = leader_gamma["ref"]
+        alpha_ledger_before = len(await ledger_redis.lrange(f"{main.PLAYER_LEDGER_PREFIX}leader-alpha", 0, -1))
+        removed_one = await main.delete_player_completely("leader-gamma", gamma_ref, "pit-boss", "regression: single delete")
+        assert removed_one["group_competitive_removed"] == 1
+        assert await main.get_balance("leader-gamma") == main.DEFAULT_BALANCE, "get_balance must silently recreate a deleted user, not error"
+        assert await main.load_player_profile("leader-gamma") is None
+        assert await ledger_redis.hget(main.PLAYER_PROFILE_REFS_KEY, gamma_ref) is None
+        assert await ledger_redis.lrange(f"{main.PLAYER_LEDGER_PREFIX}leader-gamma", 0, -1) == []
+        assert await ledger_redis.hget(f"{main.GROUP_COMPETITIVE_PREFIX}{group['ref']}", "leader-gamma") is None
+        assert await ledger_redis.hget(f"{main.GROUP_COMPETITIVE_PREFIX}{group['ref']}", "leader-beta") is not None, "unrelated player's group-leaderboard entry must survive"
+        assert await main.load_player_profile("leader-alpha") is not None, "unrelated player's profile must survive"
+        assert len(await ledger_redis.lrange(f"{main.PLAYER_LEDGER_PREFIX}leader-alpha", 0, -1)) == alpha_ledger_before, "unrelated player's personal ledger must be untouched"
+        admin_ledger_after_single = await ledger_redis.lrange(main.ADMIN_LEDGER_KEY, 0, -1)
+        assert not any('"target_id": "leader-gamma"' in event for event in admin_ledger_after_single), "deleted user's admin ledger entries must be purged"
+        assert any(json.loads(event).get("reason") == "player_data_deleted" and gamma_ref in json.loads(event)["target_id"] for event in admin_ledger_after_single)
+        assert not any("leader-gamma" in json.loads(event)["target_id"] for event in admin_ledger_after_single if json.loads(event).get("reason") == "player_data_deleted"), "deletion's own audit record must key by ref, not raw user_id"
+        print("Delete guard: single-player erasure wipes balance/profile/ledger/group-board and leaves everyone else untouched.")
+
+        # --- Bulk deletion: wipe every remaining player this whole ledger section
+        # ever created (profiles-only, balance-only, and everything in between),
+        # confirm the registered group's own metadata survives the wipe.
+        surviving_profile_ids = set((await ledger_redis.hgetall(main.PLAYER_PROFILES_KEY)).keys())
+        surviving_balance_ids = set((await ledger_redis.hgetall(main.BALANCES_KEY)).keys())
+        expected_removed = surviving_profile_ids | surviving_balance_ids
+        removed_all = await main.delete_all_players_completely("pit-boss", "regression: full wipe")
+        assert removed_all["players_removed"] == len(expected_removed)
+        assert removed_all["groups_cleared"] == 1
+        assert await ledger_redis.hgetall(main.PLAYER_PROFILES_KEY) == {}
+        assert await ledger_redis.hgetall(main.BALANCES_KEY) == {}
+        assert await ledger_redis.hgetall(main.PLAYER_PROFILE_REFS_KEY) == {}
+        assert await ledger_redis.hgetall(f"{main.GROUP_COMPETITIVE_PREFIX}{group['ref']}") == {}
+        admin_ledger_after_all = await ledger_redis.lrange(main.ADMIN_LEDGER_KEY, 0, -1)
+        assert len(admin_ledger_after_all) == 1, "only the bulk deletion's own audit record should remain"
+        assert json.loads(admin_ledger_after_all[0])["reason"] == "all_player_data_deleted"
+        assert await main.registered_group_for_chat("-100123") is not None, "registered group metadata itself must survive a player-data wipe"
+        print(f"Delete guard: bulk erasure wiped {removed_all['players_removed']} player record(s) and left the registered group intact.")
+
         print("Ledger guard: profiles, signed events, non-negative debits, and public-safe group registry all hold.")
     finally:
         main.redis_client = original_redis
